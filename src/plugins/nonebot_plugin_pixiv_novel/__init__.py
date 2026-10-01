@@ -76,7 +76,7 @@ from nonebot_plugin_apscheduler import scheduler
 from . import avatars, handlers, message, policy, render, store, urls
 from .config import Config
 from .message import novel_url
-from .pixiv_client import PixivClient
+from .pixiv_client import PixivClient, original_cover_url
 from .poller import poll_once
 
 plugin_config = get_plugin_config(Config)
@@ -187,6 +187,7 @@ async def _startup() -> None:
         f"R18全文允许发群={plugin_config.pixiv_r18_text_allow_group} "
         f"R18推送={plugin_config.pixiv_r18_push_enabled} "
         f"R18封面模糊={plugin_config.pixiv_blur_r18}(radius={plugin_config.pixiv_blur_radius}) "
+        f"封面={plugin_config.pixiv_cover_max_width or '原图'} "
         f"URL被动卡片={plugin_config.pixiv_url_hook_enabled}"
         f"(去重={plugin_config.pixiv_url_hook_cooldown}s)"
     )
@@ -377,18 +378,22 @@ async def _(event: MessageEvent):
 
 
 async def _fetch_cover(url: str, x_restrict: int) -> tuple[bytes, bool]:
-    """下载封面并按 R18 规则决定是否模糊。返回 `(字节, 是否已模糊)`。
+    """下载封面（**取原图**）并按 R18 规则决定是否模糊。返回 `(字节, 是否已模糊)`。
 
     封面拿不到**不算失败**：返回空字节，卡片照样发（只是没图）。
+    图没下来时 `blurred` 一定是 False —— 否则文案会说「封面已模糊」而根本没有图。
     """
     if not url:
         return b"", False
     blurred = plugin_config.pixiv_blur_r18 and x_restrict in (1, 2)
     try:
         data = await client.download_cover(
-            url, blur=blurred, radius=plugin_config.pixiv_blur_radius
+            original_cover_url(url),
+            blur=blurred,
+            radius=plugin_config.pixiv_blur_radius,
+            max_width=plugin_config.pixiv_cover_max_width,
         )
-        return data, blurred
+        return data, blurred and bool(data)
     except Exception as e:
         logger.warning(f"URL hook 下载封面失败（卡片改为无图）: {type(e).__name__}: {e}")
         return b"", False

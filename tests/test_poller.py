@@ -28,7 +28,13 @@ class FakeUser:
 
 @dataclass
 class FakeImageUrls:
-    large: str = "https://i.pximg.net/cover.jpg"
+    # ⚠️ **必须复刻真实形状**：App 返回的 `large` 带 CDN 缩放段 `/c/240x480_80/`
+    # （实测实际只有 240x347）。如果这里写成不带缩放段的假 URL，
+    # 「poller 有没有取原图」的接线断言就会**假通过**。
+    large: str = (
+        "https://i.pximg.net/c/240x480_80/novel-cover-master/img/2026/04/14/16/26/17/"
+        "sci15744810_x_master1200.jpg"
+    )
 
 
 @dataclass
@@ -48,6 +54,7 @@ class FakeClient:
         self.novels_by_author = novels_by_author
         self.detail_map = detail_map or {}
         self.cover_calls = []
+        self.cover_max_widths = []
 
     async def user_novels(self, author_id):
         return self.novels_by_author.get(author_id, [])
@@ -55,8 +62,10 @@ class FakeClient:
     async def novel_detail(self, novel_id):
         return self.detail_map[novel_id]
 
-    async def download_cover(self, url, *, blur, radius):
+    async def download_cover(self, url, *, blur, radius, max_width=0):
+        # 记录 max_width 单独一列，不动下面那些三元素解包的老断言
         self.cover_calls.append((url, blur, radius))
+        self.cover_max_widths.append(max_width)
         return b"\xff\xd8fakejpeg"
 
 
@@ -125,6 +134,51 @@ async def test_r18_cover_is_blurred_when_enabled():
     url, blur, radius = client.cover_calls[-1]
     assert blur is True
     assert radius == 9                       # 模糊半径来自配置（固定 px）
+
+
+@pytest.mark.asyncio
+async def test_poller_requests_the_original_cover_not_the_thumbnail():
+    """⚠️ 接线断言：poller 传给下载的 URL **必须是原图**（没有 `/c/…/` 缩放段）。
+
+    纯函数 `original_cover_url()` 测得再对，**忘了在调用处用**也全绿 ——
+    这类「写了函数没人调」的错只有全链路断言抓得到。
+    实测 App 的 `image_urls.large` 带 `/c/240x480_80/`（240x347 小图），
+    去掉缩放段才是 828x1200 的原图。
+    """
+    store.subscribe(100, 200, baseline=0)
+    client = FakeClient({200: [FakeNovel(500)]}, {500: FakeNovel(500)})
+    await poller.poll_once(client, _cfg(), send=_noop_send, send_file=None)   # 播种
+
+    client.novels_by_author[200] = [FakeNovel(600), FakeNovel(500)]
+    client.detail_map[600] = FakeNovel(600)
+    await poller.poll_once(client, _cfg(), send=_noop_send, send_file=None)
+
+    url = client.cover_calls[-1][0]
+    assert url, "这一轮应该真的去下封面了"
+    assert "/c/" not in url, f"带缩放段说明还是缩略图，没取原图：{url}"
+
+
+@pytest.mark.asyncio
+async def test_poller_passes_cover_max_width_from_config():
+    """配置的封面宽度上限要**真的传到下载层**（默认 0 = 原图）。"""
+    store.subscribe(100, 200, baseline=0)
+    client = FakeClient({200: [FakeNovel(500)]}, {500: FakeNovel(500)})
+    await poller.poll_once(client, _cfg(), send=_noop_send, send_file=None)
+
+    client.novels_by_author[200] = [FakeNovel(600), FakeNovel(500)]
+    client.detail_map[600] = FakeNovel(600)
+    await poller.poll_once(
+        client, _cfg(pixiv_cover_max_width=800), send=_noop_send, send_file=None
+    )
+
+    assert client.cover_max_widths[-1] == 800
+
+    await poller.poll_once(client, _cfg(), send=_noop_send, send_file=None)
+    # 默认 0 = 发原图（用户 2026-10-02 拍板）
+    client.novels_by_author[200] = [FakeNovel(700), FakeNovel(600)]
+    client.detail_map[700] = FakeNovel(700)
+    await poller.poll_once(client, _cfg(), send=_noop_send, send_file=None)
+    assert client.cover_max_widths[-1] == 0
 
 
 @pytest.mark.asyncio
@@ -322,6 +376,7 @@ class _FixtureClient:
         self._novels = novels
         self._detail = detail
         self.cover_calls = []
+        self.cover_max_widths = []
 
     async def user_novels(self, author_id):
         return self._novels
@@ -330,8 +385,10 @@ class _FixtureClient:
         # 真实 client 的返回值 = 解包后的 novel 本体
         return self._detail
 
-    async def download_cover(self, url, *, blur, radius):
+    async def download_cover(self, url, *, blur, radius, max_width=0):
+        # 记录 max_width 单独一列，不动下面那些三元素解包的老断言
         self.cover_calls.append((url, blur, radius))
+        self.cover_max_widths.append(max_width)
         return b"\xff\xd8\xff\xe0fakejpeg"
 
 

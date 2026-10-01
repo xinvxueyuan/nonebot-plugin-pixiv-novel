@@ -294,8 +294,12 @@ async def test_download_cover_applies_blur(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_download_cover_can_skip_blur(monkeypatch):
+    # ⚠️ 图必须**够大**（> 160px）：小图会被「占位图检测」当成 pixiv 的
+    # limit_unknown 占位图丢掉（返回空字节），这条测试就没意义了。
+    big = _png_bytes(size=(640, 900))
+
     class FakeResp:
-        content = _png_bytes()
+        content = big
 
         def raise_for_status(self):
             pass
@@ -316,7 +320,8 @@ async def test_download_cover_can_skip_blur(monkeypatch):
     monkeypatch.setattr(pixiv_client.httpx, "AsyncClient", FakeClient)
     c = PixivClient("tok", "")
     out = await c.download_cover("https://i.pximg.net/x.jpg", blur=False, radius=9)
-    assert out == _png_bytes()
+    # 既不模糊也不缩放 → **原样返回**，不重编码（省 CPU、不掉一次质量）
+    assert out == big
 
 
 # ══════════════════════════════════════════════════════════════════

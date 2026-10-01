@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import re
 import time
 from collections.abc import Callable
 from typing import Any
@@ -45,6 +46,95 @@ def blur_image(data: bytes, radius: int) -> bytes:
     """
     img = Image.open(io.BytesIO(data)).convert("RGB")
     img = img.filter(ImageFilter.GaussianBlur(radius=radius))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=88)
+    return buf.getvalue()
+
+
+# ── 封面原图 / 占位图 / 尺寸 ────────────────────────────────────────
+#
+# CDN 的缩放段：`/c/240x480_80/`、`/c/600x600/` 这种。**去掉它就是原图**。
+# 实测（2026-10-02，真实下载后量像素）：
+#   App `image_urls.large` = …/c/240x480_80/novel-cover-master/…_master1200.jpg → 240x347  24KB
+#   Web `coverUrl`         = …/c/600x600/novel-cover-master/…_master1200.jpg   → 414x600 192KB
+#   两者去掉 /c/ 段后**是同一个文件**                          → 828x1200 662KB（原图）
+# 所以「App 给的是小图」不是因为接口差，而是 CDN 缩放档位；**不需要换接口**。
+_COVER_SCALE_RE = re.compile(r"/c/\d+x\d+(?:_\d+)?/")
+
+# pixiv 用这些图代替「不可见 / 受限 / 不存在」的封面。
+# ⚠️ App 接口对这类作品**不抛异常**，而是返回占位图 URL（实测作品 29000000），
+# 不检查就会把 100x100 的 limit_unknown 图当封面发进群里。
+_PLACEHOLDER_URL_MARKERS = ("limit_unknown", "/common/images/", "no_profile")
+
+# 真实小说封面最小也有 640x900；占位图是 100x100。160 是两者之间的安全阈值。
+_PLACEHOLDER_MAX_SIDE = 160
+
+
+def original_cover_url(url: str) -> str:
+    """把 CDN 缩略封面 URL 换成**原图** URL。
+
+    ⚠️ 只对 `_master1200` 结尾的图合适：`_square1200` 是**裁切过的方图**，
+    去掉 /c/ 段会拿到 1200x1200 方图（不是封面比例）→ 这种原样返回。
+    头像 URL 没有 /c/ 段（`…/xxx_170.jpg`），套用无副作用。
+    """
+    if not url:
+        return ""
+    if "_square" in url:
+        return url
+    return _COVER_SCALE_RE.sub("/", url)
+
+
+def is_placeholder_url(url: str) -> bool:
+    """URL 层面就能判出占位图 —— 省掉一次网络请求。"""
+    if not url:
+        return True
+    low = url.lower()
+    return any(m in low for m in _PLACEHOLDER_URL_MARKERS)
+
+
+def image_size(data: bytes) -> tuple[int, int] | None:
+    """读图片尺寸（PIL 懒加载，只读头部，不解码像素）。读不出来返 None。"""
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            return img.size
+    except Exception:
+        return None
+
+
+def is_placeholder_image(data: bytes) -> bool:
+    """字节层面兜底：尺寸过小就当占位图（防住 URL 特征没覆盖到的占位图）。"""
+    size = image_size(data)
+    if size is None:
+        return False  # 解不开的图交给后面的流程报错，别在这儿吞掉
+    return min(size) <= _PLACEHOLDER_MAX_SIDE
+
+
+def process_cover(data: bytes, *, blur: bool, radius: int, max_width: int = 0) -> bytes:
+    """封面后处理：先按需缩放，再按需模糊。统一以 JPEG 输出。
+
+    ⚠️ 顺序是**先缩放、后模糊**：配置的半径是「固定像素」（用户明确要求 6–12px），
+    必须作用在**最终发出的那张图**上；先模糊再缩放会把半径一起缩掉，
+    「固定 9px」的语义就没了。
+
+    `max_width<=0` 表示不缩放（发原图）。既没缩放也没模糊时**原样返回字节**，
+    不重编码（省 CPU、也不掉一次质量）。
+    """
+    img = Image.open(io.BytesIO(data))
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
+    resized = False
+    if max_width > 0 and img.width > max_width:
+        height = max(1, round(img.height * max_width / img.width))
+        img = img.resize((max_width, height), Image.Resampling.LANCZOS)
+        resized = True
+
+    if blur:
+        img = img.filter(ImageFilter.GaussianBlur(radius=radius))
+
+    if not resized and not blur:
+        return data
+
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=88)
     return buf.getvalue()
@@ -103,8 +193,11 @@ def _check_novel_shape(novel: Any) -> None:
 # publishedContentCount / publishedTotalCharacterCount / isConcluded / tags / cover.urls。
 SERIES_WEB_API = "https://www.pixiv.net/ajax/novel/series/{series_id}"
 
-# 系列封面的候选键，按「适合群里显示」的大小优先（太大拖慢经代理的下载）
-_SERIES_COVER_KEYS = ("480mw", "1200x1200", "240mw", "original", "128x128")
+# 系列封面的候选键，**大的优先**（群里看得清）。
+# ⚠️ 这里曾经把 480mw 排在最前，理由是「太大拖慢经代理的下载」—— 实测推翻：
+#   同一张图 original=1280x1856(345KB) / 1200x1200=828x1200(678KB) / 480mw=480x696(240KB)
+#   original 不但更大、字节还比 1200x1200 更小（PNG 压缩得好），排后面纯属白白发小图。
+_SERIES_COVER_KEYS = ("original", "1200x1200", "480mw", "240mw", "128x128")
 
 
 def series_cover_url(body: Any) -> str:
@@ -270,10 +363,25 @@ class PixivClient:
         _check_series_shape(body)
         return body
 
-    async def download_cover(self, url: str, *, blur: bool, radius: int) -> bytes:
-        """下载封面，可选高斯模糊（`blur=True` 时用 `radius` 像素作半径）。"""
+    async def download_cover(
+        self, url: str, *, blur: bool, radius: int, max_width: int = 0
+    ) -> bytes:
+        """下载封面 → 按需缩放到 `max_width` → 按需高斯模糊（`radius` 像素）。
+
+        封面**不可用**时返回**空字节**（而不是抛异常），调用方按「没封面」处理：
+          · URL 是 pixiv 占位图（作品不可见/受限，App 接口不抛异常只换 URL）
+          · 下到的图尺寸过小（字节层面兜底）
+        这两种情况打 warning，不静默。
+        """
+        if not url:
+            return b""
+        if is_placeholder_url(url):
+            logger.warning(f"封面是 pixiv 占位图（作品不可见/受限），本次不带图：{url}")
+            return b""
         data = await self.fetch_image(url)
-        if blur:
-            # 纯 CPU 操作，丢线程池避免阻塞事件循环
-            data = await asyncio.to_thread(blur_image, data, radius)
-        return data
+        if is_placeholder_image(data):
+            logger.warning(f"封面下到占位图 {image_size(data)}（作品不可见/受限），本次不带图：{url}")
+            return b""
+        return await asyncio.to_thread(
+            process_cover, data, blur=blur, radius=radius, max_width=max_width
+        )

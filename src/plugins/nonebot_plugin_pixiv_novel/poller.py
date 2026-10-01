@@ -15,7 +15,7 @@ from nonebot.adapters.onebot.v11 import Message
 from . import store
 from .config import Config
 from .message import build_push
-from .pixiv_client import PixivClient
+from .pixiv_client import PixivClient, original_cover_url
 
 logger = logging.getLogger("nonebot_plugin_pixiv_novel")
 
@@ -112,7 +112,11 @@ async def poll_once(
 
                 cover: bytes | None = None
                 blurred = False
-                cover_url = getattr(getattr(detail, "image_urls", None), "large", "") or ""
+                # 取**原图**：App 的 image_urls.large 是 CDN 缩略（实测 240x347），
+                # 去掉 /c/ 缩放段才是原图（828x1200 起）。见 pixiv_client.original_cover_url
+                cover_url = original_cover_url(
+                    getattr(getattr(detail, "image_urls", None), "large", "") or ""
+                )
                 if cover_url:
                     should_blur = bool(config.pixiv_blur_r18 and x_restrict > 0)
                     try:
@@ -120,8 +124,10 @@ async def poll_once(
                             cover_url,
                             blur=should_blur,
                             radius=config.pixiv_blur_radius,
+                            max_width=config.pixiv_cover_max_width,
                         )
-                        blurred = should_blur
+                        # 图没下来（占位图/失败）就别声称「已模糊」—— 文案会自相矛盾
+                        blurred = should_blur and bool(cover)
                     except Exception as e:
                         logger.warning(f"下载封面 {cover_url} 失败: {type(e).__name__}: {e}")
 

@@ -47,6 +47,12 @@ class Config(BaseModel):
         default=9, ge=6, le=12,
         description="高斯模糊半径（像素）。取值 6~12，默认 9；固定像素，不随图片尺寸缩放",
     )
+    pixiv_cover_max_width: int = Field(
+        default=0, ge=0, le=2400,
+        description="封面最大宽度（像素）。**0 = 发原图**（默认）；"
+        ">0 时服务端把封面缩到该宽度再发，用来控制消息体积"
+        "（原图约 1MB、base64 后约 1.3MB；缩到 800 约 156KB）",
+    )
 
     # ---- R18 新作推送（与上面的全文开关是**两回事**，别混）----
     pixiv_r18_push_enabled: bool = Field(

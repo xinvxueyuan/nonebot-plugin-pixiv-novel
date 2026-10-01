@@ -116,3 +116,28 @@ def test_url_hook_is_independent_of_push_switches():
     """关掉新作推送不影响被动卡片，反之亦然 —— 两者是不同功能。"""
     assert Config(pixiv_r18_push_enabled=False).pixiv_url_hook_enabled is True
     assert Config(pixiv_url_hook_enabled=False).pixiv_r18_push_enabled is True
+
+
+def test_cover_max_width_defaults_to_original():
+    """**默认 0 = 发原图**（2026-10-02 用户拍板）。
+
+    背景：App 的 `image_urls.large` 是 CDN 缩略（实测 240x347 / 24KB），
+    去掉 `/c/…/` 缩放段才是原图（828x1200 起 / 661KB~1007KB，约 37 倍）。
+    用户实测后要求发原图，所以默认不缩放。
+    """
+    assert Config().pixiv_cover_max_width == 0
+    assert Config().pixiv_cover_max_width or "原图" == "原图"   # 启动行按这个显示
+
+
+def test_cover_max_width_range():
+    """0 合法（= 不缩放）；负数无意义；上限 2400 防止手滑写成像素尺寸以外的值。"""
+    import pydantic
+    import pytest
+
+    assert Config(pixiv_cover_max_width=0).pixiv_cover_max_width == 0
+    assert Config(pixiv_cover_max_width=800).pixiv_cover_max_width == 800
+    assert Config(pixiv_cover_max_width=2400).pixiv_cover_max_width == 2400
+    with pytest.raises(pydantic.ValidationError):
+        Config(pixiv_cover_max_width=-1)
+    with pytest.raises(pydantic.ValidationError):
+        Config(pixiv_cover_max_width=2401)

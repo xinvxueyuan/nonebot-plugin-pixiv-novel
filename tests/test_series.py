@@ -65,14 +65,34 @@ def test_series_fixture_has_no_nested_novel_series_detail():
 # ══════════════════════════════════════════════════════════════════
 
 
-def test_series_cover_url_prefers_480mw():
+def test_series_cover_url_prefers_original_the_biggest():
+    """⚠️ **必须优先 `original`（最大的那张）**。
+
+    实测（2026-10-02，把图下下来量像素）同一张系列封面：
+      original   = 1280x1856 (345KB)
+      1200x1200  =  828x1200 (678KB)
+      480mw      =  480x696  (240KB)
+    这里曾把 480mw 排最前，理由是「太大拖慢下载」—— 用户实测指出发出去的图太小，
+    改成 original 优先。
+
+    这条用**真实 fixture** 断言，并把顺序钉死：谁把 480mw 挪回最前，这条必红。
+    """
     body = load_fixture(R18_SERIES)
-    url = series_cover_url(body)
-    assert "/c/480x960/" in url                  # 480mw 是首选（群里够看又不慢）
+    urls = body["cover"]["urls"]
+    assert urls["original"], "fixture 里应该有 original，否则这条测试失去意义"
+    assert series_cover_url(body) == urls["original"]
+
+
+def test_series_cover_key_order_is_largest_first():
+    """顺序本身也要钉住 —— 光靠 fixture 会被「恰好 original 在前面」蒙过去。"""
+    assert pixiv_client._SERIES_COVER_KEYS[0] == "original"
+    assert pixiv_client._SERIES_COVER_KEYS.index("480mw") > pixiv_client._SERIES_COVER_KEYS.index(
+        "original"
+    )
 
 
 def test_series_cover_url_falls_back_through_candidates():
-    """480mw 缺失时要退到下一个候选，而不是直接空手而归。
+    """缺哪个就退到下一个候选，而不是直接空手而归。
 
     断言的是「**选中了哪个候选**」（返回的正是那个键的 URL），
     不是 URL 里含什么字串 —— 后者测的是 pixiv 的 CDN 路径格式，不是本函数的逻辑。
@@ -81,9 +101,9 @@ def test_series_cover_url_falls_back_through_candidates():
     assert series_cover_url({"cover": {"urls": {"240mw": "u240"}}}) == "u240"
     assert series_cover_url({"cover": {"urls": {"original": "uorig"}}}) == "uorig"
     assert series_cover_url({"cover": {"urls": {"128x128": "u128"}}}) == "u128"
-    # 有多个时按优先级取前面的
+    # 有多个时按优先级取前面的 —— original 最大，所以它赢
     both = {"cover": {"urls": {"original": "uorig", "480mw": "u480", "240mw": "u240"}}}
-    assert series_cover_url(both) == "u480"
+    assert series_cover_url(both) == "uorig"
 
 
 @pytest.mark.parametrize(

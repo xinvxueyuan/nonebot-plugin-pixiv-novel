@@ -129,7 +129,7 @@ async def test_build_novel_card_uses_detail_and_blurs_r18(monkeypatch):
 
     blur_calls = []
 
-    async def fake_cover(url, *, blur, radius):
+    async def fake_cover(url, *, blur, radius, max_width=0):
         blur_calls.append((url, blur, radius))
         return b"\x89PNG"
 
@@ -143,7 +143,11 @@ async def test_build_novel_card_uses_detail_and_blurs_r18(monkeypatch):
 
     assert blur_calls and blur_calls[0][1] is True      # blur=True
     assert blur_calls[0][2] == 9                        # 半径用配置值
-    assert "R-18" in text and "已模糊" in text
+    # ⚠️ 接线断言：真实 fixture 的 image_urls.large 带 CDN 缩放段 `/c/240x480_80/`，
+    # 取原图后这里不该再有缩放段（忘了调用 original_cover_url 会在这条变红）。
+    assert "/c/" not in blur_calls[0][0], f"还在用缩略图，没取原图：{blur_calls[0][0]}"
+    assert "已模糊" in text
+    assert "R-18" in text
     assert "https://www.pixiv.net/novel/show.php?id=" in text
 
 
@@ -158,7 +162,7 @@ async def test_build_novel_card_does_not_blur_when_disabled(monkeypatch):
     async def fake_detail(novel_id):
         return detail
 
-    async def fake_cover(url, *, blur, radius):
+    async def fake_cover(url, *, blur, radius, max_width=0):
         blur_calls.append(blur)
         return b"\x89PNG"
 
@@ -185,7 +189,7 @@ async def test_build_novel_card_skips_cover_download_when_url_missing(monkeypatc
 
     called = []
 
-    async def fake_cover(url, *, blur, radius):
+    async def fake_cover(url, *, blur, radius, max_width=0):
         called.append(url)
         return b""
 
@@ -208,7 +212,7 @@ async def test_build_series_card_uses_series_level_x_restrict(monkeypatch):
     async def fake_series(series_id):
         return body
 
-    async def fake_cover(url, *, blur, radius):
+    async def fake_cover(url, *, blur, radius, max_width=0):
         blur_calls.append((url, blur))
         return b"\x89PNG"
 
@@ -234,7 +238,7 @@ async def test_build_series_card_safe_series_not_blurred(monkeypatch):
     async def fake_series(series_id):
         return body
 
-    async def fake_cover(url, *, blur, radius):
+    async def fake_cover(url, *, blur, radius, max_width=0):
         blur_calls.append(blur)
         return b"\x89PNG"
 
