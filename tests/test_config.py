@@ -90,3 +90,29 @@ def test_poll_interval_has_lower_bound():
 
     with pytest.raises(pydantic.ValidationError):
         Config(pixiv_poll_interval=1)   # 不能让用户设成 1 秒，会被 pixiv 限流
+
+
+def test_url_hook_defaults():
+    """被动 URL hook 的两个开关：默认开、冷却 60s。"""
+    c = Config()
+    assert c.pixiv_url_hook_enabled is True     # 默认开启（群聊 + 私聊都响应）
+    assert c.pixiv_url_hook_cooldown == 60      # 同作品 60s 内不重复回
+
+
+def test_url_hook_cooldown_range_and_zero_means_no_dedupe():
+    """0 是**合法值**，语义是「不去重」—— 不是「用默认值」。"""
+    import pydantic
+    import pytest
+
+    assert Config(pixiv_url_hook_cooldown=0).pixiv_url_hook_cooldown == 0
+    assert Config(pixiv_url_hook_cooldown=3600).pixiv_url_hook_cooldown == 3600
+    with pytest.raises(pydantic.ValidationError):
+        Config(pixiv_url_hook_cooldown=-1)      # 负数无意义
+    with pytest.raises(pydantic.ValidationError):
+        Config(pixiv_url_hook_cooldown=3601)    # 上限 1 小时，避免「等于永久静音」
+
+
+def test_url_hook_is_independent_of_push_switches():
+    """关掉新作推送不影响被动卡片，反之亦然 —— 两者是不同功能。"""
+    assert Config(pixiv_r18_push_enabled=False).pixiv_url_hook_enabled is True
+    assert Config(pixiv_url_hook_enabled=False).pixiv_r18_push_enabled is True
