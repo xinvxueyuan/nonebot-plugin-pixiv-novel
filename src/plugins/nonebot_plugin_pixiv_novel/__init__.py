@@ -316,13 +316,17 @@ async def _(event: MessageEvent, args: Message = CommandArg()):
         await text_cmd.finish(f"这篇作品没有正文内容：{novel_url(novel_id)}")
         return
 
-    if len(text) <= plugin_config.pixiv_text_max_chars:
-        await text_cmd.finish(f"📖 {detail.title}\n{novel_url(novel_id)}\n\n{text}")
-
-    # 太长 → 发 txt 文件；上传失败就退化成发链接
     filename = handlers.safe_filename(novel_id, detail.title)
-    if await _send_file(event, filename, text):
-        await text_cmd.finish(f"📖 {detail.title}\n正文过长（{len(text)} 字），已作为 txt 文件发送")
-    await text_cmd.finish(
-        f"📖 {detail.title}\n正文过长（{len(text)} 字），上传文件失败，请点链接阅读：{novel_url(novel_id)}"
+
+    # 交付：内联 / 文件 / 链接 三级降级（逻辑在 handlers 里，可单测）
+    used = await handlers.deliver_novel_text(
+        text=text,
+        title=detail.title,
+        novel_id=novel_id,
+        filename=filename,
+        max_chars=plugin_config.pixiv_text_max_chars,
+        send_text=lambda msg: text_cmd.send(msg),
+        send_file=lambda fn, body: _send_file(event, fn, body),
     )
+    logger.info(f"作品 {novel_id} 正文交付方式: {used}")
+    await text_cmd.finish()

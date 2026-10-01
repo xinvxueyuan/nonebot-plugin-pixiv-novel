@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from . import store
-from .message import user_url
+from .message import novel_url, user_url
+
+logger = logging.getLogger("nonebot_plugin_pixiv_novel")
 
 _ID_RE = re.compile(r"(\d{3,})")
 
@@ -34,6 +38,79 @@ def safe_filename(novel_id: int, title: str, limit: int = 20) -> str:
     """
     cleaned = _FILENAME_BAD_RE.sub("_", title[:limit]).strip(" ._")
     return f"{novel_id}_{cleaned or 'untitled'}.txt"
+
+
+async def deliver_novel_text(
+    *,
+    text: str,
+    title: str,
+    novel_id: int,
+    filename: str,
+    max_chars: int,
+    send_text: Callable[[str], Awaitable[Any]],
+    send_file: Callable[[str, str], Awaitable[bool]],
+) -> str:
+    """把正文交付给用户，三级降级。返回实际走的分支名。
+
+    分支：
+      · `inline`              长度 ≤ max_chars，内联发成功
+      · `file`                长度超限，发 txt 文件成功
+      · `file_after_inline`   内联发失败（多半是超平台单条上限），改发文件成功
+      · `link`                文件和/或内联都失败 → 至少把链接给出去
+      · `empty`               正文为空（理论上调用方已拦）
+
+    ⚠️⚠️ **为什么这里不在 `finish()` 外面套 `try/except Exception`**：
+    NoneBot 的 `Matcher.finish()` 正常结束时会抛 `FinishedException`，
+    而它是 **`Exception` 的子类**（MRO: FinishedException → MatcherException →
+    NoneBotException → **Exception**）。所以
+
+        try:
+            await matcher.finish(msg)      # 发送成功
+        except Exception:                  # ← 会把「成功」也抓进来
+            ...降级发文件...
+
+    会让**每次内联发送成功后又多发一个文件**。
+
+    这里用 `send_text`（只发消息，**不带控制流**）而不是 `finish`，
+    结构上就不会踩到这个坑；`send_text` 抛出的才是真的发送失败
+    （平台拒收 / 超长 / 限流）。
+    """
+    if not text.strip():
+        return "empty"
+
+    body = f"📖 {title}\n{novel_url(novel_id)}\n\n{text}"
+
+    if len(text) <= max_chars:
+        try:
+            await send_text(body)
+            return "inline"
+        except Exception as e:
+            logger.warning(
+                f"内联发送正文失败（{len(text)} 字），改发文件: {type(e).__name__}: {e}"
+            )
+            try:
+                if await send_file(filename, text):
+                    await send_text(
+                        f"📖 {title}\n正文内联发送失败（{len(text)} 字），已作为 txt 文件发送"
+                    )
+                    return "file_after_inline"
+            except Exception as e2:
+                logger.warning(f"降级发文件也失败: {type(e2).__name__}: {e2}")
+            await send_text(f"📖 {title}\n正文暂时发不出来，请点链接阅读：{novel_url(novel_id)}")
+            return "link"
+
+    # 超过阈值 → 直接发 txt 文件
+    try:
+        if await send_file(filename, text):
+            await send_text(f"📖 {title}\n正文过长（{len(text)} 字），已作为 txt 文件发送")
+            return "file"
+    except Exception as e:
+        logger.warning(f"发送 txt 文件失败: {type(e).__name__}: {e}")
+
+    await send_text(
+        f"📖 {title}\n正文过长（{len(text)} 字），上传文件失败，请点链接阅读：{novel_url(novel_id)}"
+    )
+    return "link"
 
 
 def _author_label(row_or_id: Any, name: str = "") -> str:
