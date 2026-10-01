@@ -24,9 +24,8 @@ nonebot.init(driver="~none", log_level="INFO")
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "plugins"))
 
-from PIL import Image, ImageDraw  # noqa: E402
-
 from nonebot_plugin_pixiv_novel import avatars, render  # noqa: E402
+from PIL import Image, ImageDraw  # noqa: E402
 
 OUT = Path(__file__).parent.parent / "out"
 
