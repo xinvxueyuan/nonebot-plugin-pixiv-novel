@@ -17,6 +17,31 @@ def _as_id_set(ids: Iterable[object]) -> set[str]:
     return {str(i) for i in ids}
 
 
+def is_admin_identity(
+    user_id: object,
+    *,
+    admin_ids: Iterable[object],
+    superusers: Iterable[object],
+) -> bool:
+    """**纯身份**判定：这个 QQ 号是不是管理员 —— 与「闸门开关」无关。
+
+    为什么必须和 `is_admin()` 分开（这里踩过一个坑）：
+    `is_admin()` 在 `admin_only=False` 时对**所有人**返回 True（那是「放行」的语义）。
+    如果把它的结果直接当作「可以绕过 R18/渠道限制」的判据，
+    那么一旦把 `pixiv_admin_only` 关掉让普通群友也能用命令，
+    **每个普通群友都会被当成管理员**，两轴随之彻底失效 —— 改配置等于白改。
+
+    所以两件事分开：
+      · 「能不能用这个命令」→ `is_admin()`（含 admin_only 开关）
+      · 「是不是管理员本人」→ 本函数（只看名单）
+    """
+    uid = str(user_id)
+    explicit = _as_id_set(admin_ids)
+    if explicit:
+        return uid in explicit
+    return uid in _as_id_set(superusers)
+
+
 def is_admin(
     user_id: object,
     *,
@@ -24,7 +49,7 @@ def is_admin(
     admin_ids: Iterable[object],
     superusers: Iterable[object],
 ) -> bool:
-    """管理员判定。
+    """命令闸门：这个用户能不能用命令。
 
     admin_only=False            → 所有人放行（闸门关掉）
     admin_ids 非空              → 只认这个名单
@@ -32,11 +57,7 @@ def is_admin(
     """
     if not admin_only:
         return True
-    uid = str(user_id)
-    explicit = _as_id_set(admin_ids)
-    if explicit:
-        return uid in explicit
-    return uid in _as_id_set(superusers)
+    return is_admin_identity(user_id, admin_ids=admin_ids, superusers=superusers)
 
 
 def decide_text_delivery(

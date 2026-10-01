@@ -1,4 +1,10 @@
-from nonebot_plugin_pixiv_novel.policy import decide_text_delivery, is_admin
+from pathlib import Path
+
+from nonebot_plugin_pixiv_novel.policy import (
+    decide_text_delivery,
+    is_admin,
+    is_admin_identity,
+)
 
 # ── 管理员闸门（需求：所有指令默认仅管理员可用）───────────────
 
@@ -175,3 +181,94 @@ def test_r18_rejection_suggests_private_only_when_private_is_available():
         channel="group", x_restrict=1, **_cfg(pixiv_text_targets=["group", "private"])
     )
     assert "私聊" in reason2             # 配了 private 才建议私聊
+
+
+# ══════════════════════════════════════════════════════════════════
+# 身份 ≠ 闸门：这两件事必须分开
+#
+# 踩过的坑：`is_admin()` 在 `admin_only=False` 时对**所有人**返回 True（放行语义）。
+# 若把它直接当作「可绕过两轴」的判据，那么一关掉 admin_only 让普通群友也能用命令，
+# **每个群友都会被当成管理员**，R18/渠道两轴随之彻底失效 —— 改配置等于白改。
+# ══════════════════════════════════════════════════════════════════
+
+
+def test_identity_ignores_admin_only_switch():
+    """身份判定只看名单，不受 admin_only 影响。"""
+    su = ["1330509996", "2846018938"]
+    # 闸门关掉时：闸门对所有人放行，但身份仍然只认名单里的人
+    assert is_admin(42, admin_only=False, admin_ids=[], superusers=su) is True
+    assert is_admin_identity(42, admin_ids=[], superusers=su) is False
+
+    assert is_admin(1330509996, admin_only=False, admin_ids=[], superusers=su) is True
+    assert is_admin_identity(1330509996, admin_ids=[], superusers=su) is True
+
+
+def test_identity_prefers_explicit_admin_ids():
+    assert is_admin_identity(123, admin_ids=[123], superusers=["999"]) is True
+    assert is_admin_identity(999, admin_ids=[123], superusers=["999"]) is False
+
+
+def test_gate_and_identity_agree_when_admin_only_is_on():
+    """admin_only=True 时两者结论一致（闸门就是身份）。"""
+    su = ["1"]
+    for uid in (1, 2):
+        for ids in ([], [1]):
+            assert is_admin(uid, admin_only=True, admin_ids=ids, superusers=su) == \
+                is_admin_identity(uid, admin_ids=ids, superusers=su)
+
+
+def test_ordinary_member_cannot_bypass_axes_while_admin_can():
+    """把整个语义摆在一起：同一篇 R18、同一个群，
+    普通成员被拦、管理员放行 —— 这正是拆开两者的目的。
+    """
+    cfg = {"pixiv_text_targets": ["group"], "pixiv_r18_text_allow_group": False}
+    su = ["1330509996"]
+
+    member_is_admin = is_admin_identity(42, admin_ids=[], superusers=su)
+    admin_is_admin = is_admin_identity(1330509996, admin_ids=[], superusers=su)
+
+    assert decide_text_delivery(channel="group", x_restrict=1,
+                                is_admin=member_is_admin, **cfg)[0] is False
+    assert decide_text_delivery(channel="group", x_restrict=1,
+                                is_admin=admin_is_admin, **cfg)[0] is True
+
+
+def test_config_default_is_admin_only_false():
+    """配置默认值回归：默认必须是 False（否则两轴对实际使用者等于失效）。"""
+    from nonebot_plugin_pixiv_novel.config import Config
+
+    assert Config().pixiv_admin_only is False
+
+
+# ══════════════════════════════════════════════════════════════════
+# 接线检查：handler 里必须传**身份**判据，不能传**闸门**判据
+#
+# 为什么需要这条（变异测试发现的覆盖缺口）：
+# 把 `is_admin=_is_admin_identity(event)` 改成 `is_admin=_is_admin(event)` 之后，
+# 上面所有纯函数测试**依然全绿** —— 因为它们只测 policy 里的纯函数，
+# 看不见 handler 到底把哪个结果传了进去。
+# 而这个接错线的后果很隐蔽：admin_only=False（当前默认）时闸门对所有人放行，
+# 于是每个普通群友都成了「管理员」，R18/渠道两轴静默失效。
+# 所以这里直接读源码做静态断言。
+# ══════════════════════════════════════════════════════════════════
+
+
+def _pkg_source(name: str) -> str:
+    import nonebot_plugin_pixiv_novel as pkg
+
+    return (Path(pkg.__file__).parent / name).read_text(encoding="utf-8")
+
+
+def test_text_handler_passes_identity_not_gate_to_bypass():
+    src = _pkg_source("__init__.py")
+    assert "is_admin=_is_admin_identity(event)" in src, (
+        "「获取全文」的绕过判据必须是 _is_admin_identity（纯身份）；"
+        "若换成 _is_admin（闸门），admin_only=False 时人人都能绕过两轴"
+    )
+    assert "is_admin=_is_admin(event)" not in src, "绕过判据接错成闸门了"
+
+
+def test_gate_still_used_to_protect_commands():
+    """命令闸门该用 `_is_admin`（含 admin_only 开关）—— 别被顺手改掉。"""
+    src = _pkg_source("__init__.py")
+    assert src.count("if not _is_admin(event):") == 4, "4 个命令都应有管理员闸门"

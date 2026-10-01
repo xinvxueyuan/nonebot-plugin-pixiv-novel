@@ -92,7 +92,7 @@ driver = get_driver()
 
 
 def _is_admin(event: MessageEvent) -> bool:
-    """管理员闸门。判定逻辑在 policy.is_admin（纯函数，已单测）。
+    """管理员闸门：这个用户**能不能用**命令。逻辑在 policy.is_admin（纯函数，已单测）。
 
     这里**不**用 `permission=` 参数，而是放在 handler 内部：
     因为 NoneBot 的 permission 失败是**静默忽略**，用户会以为机器人坏了。
@@ -101,6 +101,21 @@ def _is_admin(event: MessageEvent) -> bool:
     return policy.is_admin(
         event.get_user_id(),
         admin_only=plugin_config.pixiv_admin_only,
+        admin_ids=plugin_config.pixiv_admin_ids,
+        superusers=list(get_driver().config.superusers),
+    )
+
+
+def _is_admin_identity(event: MessageEvent) -> bool:
+    """**纯身份**：这个人是不是管理员本人（不看 admin_only 开关）。
+
+    专供「绕过全文两轴」用。**别拿 `_is_admin()` 代替** ——
+    `pixiv_admin_only=False`（现在的默认值）时它对所有人返回 True，
+    于是每个普通群友都会被当成管理员，两轴就白设了。
+    详见 policy.is_admin_identity 的 docstring。
+    """
+    return policy.is_admin_identity(
+        event.get_user_id(),
         admin_ids=plugin_config.pixiv_admin_ids,
         superusers=list(get_driver().config.superusers),
     )
@@ -317,10 +332,10 @@ async def _(event: MessageEvent, args: Message = CommandArg()):
         pixiv_text_targets=plugin_config.pixiv_text_targets,
         pixiv_r18_text_allow_group=plugin_config.pixiv_r18_text_allow_group,
         # 管理员绕过两根轴（2026-10-02 用户要求）。
-        # 这个 handler 开头已经用 `_is_admin(event)` 拦过一道，但那道闸门可以被
-        # `pixiv_admin_only=false` 关掉（那时人人都能进来），而这里要表达的是
-        # 「**确实是管理员**的人可以无视 R18/渠道限制」，所以判定要独立再算一次。
-        is_admin=_is_admin(event),
+        # ⚠️ 这里用的是 `_is_admin_identity`（纯身份），**不是** `_is_admin`
+        # （闸门）。因为 `pixiv_admin_only` 默认已改成 False，闸门对所有人放行；
+        # 若拿闸门结果当绕过判据，每个普通群友都会被当成管理员，两轴就白设了。
+        is_admin=_is_admin_identity(event),
     )
     if not allowed:
         await text_cmd.finish(reason)

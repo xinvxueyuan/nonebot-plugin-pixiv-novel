@@ -54,14 +54,19 @@ class Config(BaseModel):
         description="R18 新作是否推送；false=遇到 R18 新作静默跳过（高水位照常推进）",
     )
 
-    # ---- 权限（所有指令默认仅管理员可用）----
+    # ---- 权限 ----
+    # 默认 **False**（2026-10-02 用户拍板）：让群里普通成员也能用这 4 个命令，
+    # 这样「渠道轴 / R18 轴」才真的对非管理员生效（否则能进来的人全是管理员，
+    # 而管理员按需求可以绕过两轴 → 两轴等于不存在）。
+    # 要恢复「仅管理员可用」，把 PIXIV_ADMIN_ONLY 设成 true 即可。
     pixiv_admin_only: bool = Field(
-        default=True,
-        description="指令是否仅管理员可用；false=所有人可用",
+        default=False,
+        description="指令是否仅管理员可用；**默认 false=所有人可用**（此时两轴对非管理员生效）",
     )
     pixiv_admin_ids: list[int] = Field(
         default_factory=list,
-        description="管理员 QQ 名单；留空=回退到 NoneBot 全局 SUPERUSERS",
+        description="管理员 QQ 名单；留空=回退到 NoneBot 全局 SUPERUSERS。"
+        "注意这个名单同时决定「谁能绕过全文两轴」",
     )
 
     # ---- 全文投递 · 轴 1：哪些渠道能用「获取全文」----

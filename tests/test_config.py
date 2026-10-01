@@ -15,7 +15,10 @@ def test_defaults_are_sane():
 def test_defaults_for_the_new_axes():
     """权限 / 投递渠道 / R18 全文 / R18 推送 / 模糊半径 的默认值。"""
     c = Config()
-    assert c.pixiv_admin_only is True               # 所有指令默认仅管理员
+    # 2026-10-02 用户拍板改为 False：让普通群友也能用命令，
+    # 这样「渠道轴 / R18 轴」才真的对非管理员生效
+    # （admin_only=True 时能进来的人全是管理员，而管理员可绕过两轴 → 两轴形同不存在）。
+    assert c.pixiv_admin_only is False
     assert c.pixiv_admin_ids == []                  # 空 = 回退 SUPERUSERS
     assert c.pixiv_text_targets == ["group"]        # 默认仅群聊
     assert c.pixiv_r18_text_allow_group is False    # R18 全文默认不发群聊
