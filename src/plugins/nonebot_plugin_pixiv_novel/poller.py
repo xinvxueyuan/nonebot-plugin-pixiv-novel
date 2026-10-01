@@ -23,10 +23,19 @@ SendText = Callable[[int, Message], Awaitable[None]]
 
 
 def _is_pushable(novel) -> bool:
-    """过滤不可见 / 仅 mypixiv 可见的作品。"""
-    return bool(getattr(novel, "visible", True)) and not bool(
-        getattr(novel, "is_mypixiv_only", False)
-    )
+    """过滤不可见 / 仅 mypixiv 可见的作品。
+
+    ⚠️ 这里**必须**显式判 `is False`，不能写 `bool(getattr(novel, "visible", True))`：
+    pixivpy3 用 JsonDict 表示响应，对**缺失**的键返回 `None`（既不抛异常，
+    也**拿不到 getattr 的默认值**）。于是 `bool(None)` = False，
+    「字段缺失」会被误判成「不可见」→ 作品被**静默永久丢弃**（下次轮询高水位
+    已跨过去，再也不会推）。
+
+    缺字段时的保守方向是**照推**（宁可多推一条，也别悄悄吞掉）。
+    """
+    if getattr(novel, "visible", None) is False:
+        return False
+    return getattr(novel, "is_mypixiv_only", None) is not True
 
 
 async def poll_once(

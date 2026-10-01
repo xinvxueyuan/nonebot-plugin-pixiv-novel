@@ -1,8 +1,18 @@
+import io
 from dataclasses import dataclass, field
 
 import pytest
+from conftest import load_fixture, wrap_json
 from nonebot_plugin_pixiv_novel import poller, store
 from nonebot_plugin_pixiv_novel.config import Config
+from PIL import Image
+
+
+def _real_png_bytes(size=(640, 1216), color=(200, 60, 60)) -> bytes:
+    """真正可解码的图片字节（见下面全链路测试里打桩处的说明）。"""
+    buf = io.BytesIO()
+    Image.new("RGB", size, color).save(buf, format="PNG")
+    return buf.getvalue()
 
 
 @dataclass
@@ -290,3 +300,263 @@ async def test_author_failure_does_not_break_other_authors():
     n = await poller.poll_once(client, _cfg(), send=_noop_send, send_file=None)
     assert n == 0                                            # 300 只播种
     assert store.list_by_group(100)                          # 200 的异常没让循环崩掉
+
+
+# ══════════════════════════════════════════════════════════════════
+# 真实 fixture 端到端：用录下来的 pixiv 真响应跑完整轮询链路
+#
+# 上面那些用 FakeNovel 的测试是「我相信字段长这样」；
+# 这一组是「字段实际就长这样」—— 专门堵住
+# 「novel_detail 响应顶层是 {"novel": {...}}」那类静默 bug。
+# ══════════════════════════════════════════════════════════════════
+
+
+class _FixtureClient:
+    """从真实 fixture 提供数据的假 client。
+
+    刻意**不做任何解包** —— 它就代表「pixivpy3 的原样响应」，
+    真正的解包发生在 PixivClient.novel_detail() 里。
+    """
+
+    def __init__(self, novels, detail):
+        self._novels = novels
+        self._detail = detail
+        self.cover_calls = []
+
+    async def user_novels(self, author_id):
+        return self._novels
+
+    async def novel_detail(self, novel_id):
+        # 真实 client 的返回值 = 解包后的 novel 本体
+        return self._detail
+
+    async def download_cover(self, url, *, blur, radius):
+        self.cover_calls.append((url, blur, radius))
+        return b"\xff\xd8\xff\xe0fakejpeg"
+
+
+@pytest.mark.asyncio
+async def test_real_fixture_r18_novel_is_recognised_and_not_pushed_when_switch_off():
+    """真实 fixture（x_restrict=1）在 R18 推送开关关闭时**必须**被挡住。
+
+    这是那个 bug 的直接后果验证：修复前 x_restrict 恒为 0，
+    这条 R18 作品会被当普通作品推出去。
+    """
+    fixture = load_fixture("user_novels.json")
+    novels = fixture.novels
+    detail = load_fixture("novel_detail_r18.json").novel      # 真·解包后的形状
+
+    store.subscribe(100, 61943687, baseline=0)
+    store.set_last_seen(100, 61943687, 1)          # 高水位调到最小，让所有作品都算「新」
+
+    client = _FixtureClient(novels, detail)
+    n = await poller.poll_once(
+        client, _cfg(pixiv_r18_push_enabled=False), send=_noop_send, send_file=None
+    )
+    assert n == 0                                   # 全是 R18 → 一条都不推
+    assert client.cover_calls == []                 # 也不该白白下载封面
+    assert store.list_by_group(100)[0]["last_seen"] == max(int(n_.id) for n_ in novels)
+
+
+@pytest.mark.asyncio
+async def test_real_fixture_cover_url_and_blur_actually_flow_through():
+    """打开 R18 推送后：封面 URL 要真取到（修复前恒为空）且按配置模糊。
+
+    修复前 `getattr(detail, "image_urls", None)` 恒为 None
+    → cover_url 为空 → **永远不下载封面**，需求要的封面图静默消失。
+    """
+    fixture = load_fixture("user_novels.json")
+    detail = load_fixture("novel_detail_r18.json").novel
+
+    store.subscribe(100, 61943687, baseline=0)
+    store.set_last_seen(100, 61943687, 1)
+
+    sent = []
+
+    async def _send(group_id, msg):
+        sent.append(msg)
+
+    client = _FixtureClient([fixture.novels[0]], detail)
+    n = await poller.poll_once(
+        client, _cfg(pixiv_r18_push_enabled=True, pixiv_blur_r18=True,
+                     pixiv_blur_radius=9),
+        send=_send, send_file=None,
+    )
+
+    assert n == 1
+    assert len(client.cover_calls) == 1
+    url, blur, radius = client.cover_calls[0]
+    assert url.startswith("https://i.pximg.net/")     # ← 修复前这里是空串
+    assert blur is True                               # R18 + 模糊开关 → 要模糊
+    assert radius == 9                                # 固定像素半径
+
+    text = sent[0].extract_plain_text()
+    assert "R-18" in text                             # R18 标记
+    assert "封面已模糊" in text
+    assert "むっちむち" in text                        # 真标题（修复前是 None）
+    assert "さむしんぐ" in text                        # 真作者名
+    assert "29277050" in text                         # 正文链接
+    assert "61943687" in text                         # 作者链接
+
+
+@pytest.mark.asyncio
+async def test_real_fixture_r18_off_still_blurs_when_blur_disabled():
+    """关闭模糊开关时，R18 封面不模糊但同样要推出去（两根轴互相独立）。"""
+    fixture = load_fixture("user_novels.json")
+    detail = load_fixture("novel_detail_r18.json").novel
+
+    store.subscribe(100, 61943687, baseline=0)
+    store.set_last_seen(100, 61943687, 1)
+
+    sent = []
+
+    async def _send(group_id, msg):
+        sent.append(msg)
+
+    client = _FixtureClient([fixture.novels[0]], detail)
+    await poller.poll_once(
+        client, _cfg(pixiv_r18_push_enabled=True, pixiv_blur_r18=False),
+        send=_send, send_file=None,
+    )
+    assert client.cover_calls[0][1] is False                   # 不模糊
+    assert "封面未模糊" in sent[0].extract_plain_text()
+
+
+@pytest.mark.asyncio
+async def test_missing_visible_field_is_treated_as_pushable():
+    """JsonDict 缺字段返 None：不能因为「没这个字段」就把作品静默丢掉。
+
+    `bool(getattr(n, "visible", True))` 这种写法在这里会返回 False
+    （默认值救不了），导致作品被永久丢弃且**完全不报错**。
+    """
+    from conftest import wrap_json
+
+    novel = wrap_json({"id": 999, "title": "没 visible 字段"})   # 故意不带 visible
+    assert novel.visible is None                                 # 确认前提成立
+    assert poller._is_pushable(novel) is True                    # 但必须照推
+
+    hidden = wrap_json({"id": 1, "visible": False})
+    assert poller._is_pushable(hidden) is False
+
+    mypixiv = wrap_json({"id": 2, "is_mypixiv_only": True})
+    assert poller._is_pushable(mypixiv) is False
+
+
+@pytest.mark.asyncio
+async def test_full_chain_real_pixiv_client_real_fixture(monkeypatch):
+    """**最强的一条**：真 PixivClient + 真 fixture + 真 poller，全链路跑通。
+
+    为什么还要这一条：上面 `_FixtureClient` 的 novel_detail 直接返回**已解包**的对象，
+    所以它绕过了 `unwrap_novel_shape`。如果把客户端里的解包删掉（变异测试），
+    那些用例**照样全绿**。只有让「原始 pixiv 响应」真正流过客户端，
+    才能测到解包这一环。
+
+    链路：原始响应 {"novel": {...}} → PixivClient 解包 → poller 读 x_restrict/image_urls
+          → build_push 拼消息 → 发送
+    """
+    import nonebot_plugin_pixiv_novel.pixiv_client as pc_mod
+    from nonebot_plugin_pixiv_novel.pixiv_client import PixivClient
+
+    raw_detail = load_fixture("novel_detail_r18.json")          # 原始形状，未解包
+    raw_user_novels = load_fixture("user_novels.json")
+    assert sorted(raw_detail.keys()) == ["novel"]               # 确认喂进去的是原始响应
+
+    class FakeAPI:
+        """冒充 pixivpy3，原样返回录下来的响应（**不做任何解包**）。"""
+
+        def __init__(self, **kwargs):
+            pass
+
+        def auth(self, refresh_token):
+            pass
+
+        def user_novels(self, author_id):
+            # fixture 里有 3 篇；只留 1 篇让断言干净
+            return wrap_json({"user": raw_user_novels.user,
+                              "novels": [raw_user_novels.novels[0]]})
+
+        def novel_detail(self, novel_id):
+            return raw_detail                                  # 原始 {"novel": {...}}
+
+    monkeypatch.setattr(pc_mod, "AppPixivAPI", FakeAPI)
+
+    sent = []
+    cover_calls = []
+
+    async def _send(group_id, msg):
+        sent.append(msg)
+
+    # ⚠️ 必须打桩 fetch_image：否则真 PixivClient 会真的去下 i.pximg.net，
+    # 单测里发真实网络请求 = 慢 + 不稳 + 依赖外网。
+    async def _fake_fetch(self, url):
+        cover_calls.append(url)
+        # ⚠️ 必须是**真能解码**的图片：poller 会调 blur_image()，
+        # 假字节会让 PIL 抛异常 → 封面被丢弃、blurred 变 False，
+        # 于是断言「封面已模糊」会失败（而且掩盖了真实链路）。
+        return _real_png_bytes()
+
+    monkeypatch.setattr(PixivClient, "fetch_image", _fake_fetch)
+
+    store.subscribe(100, 61943687, baseline=0)
+    store.set_last_seen(100, 61943687, 1)
+
+    real_client = PixivClient("tok", "")
+    n = await poller.poll_once(
+        real_client,
+        _cfg(pixiv_r18_push_enabled=True, pixiv_blur_r18=True, pixiv_blur_radius=9),
+        send=_send, send_file=None,
+    )
+
+    assert n == 1
+    assert len(cover_calls) == 1                      # 封面 URL 真的从解包后的对象取到了
+    assert cover_calls[0].startswith("https://i.pximg.net/")
+    text = sent[0].extract_plain_text()
+    assert "むっちむち" in text          # 真标题（不解包会是 "None"）
+    assert "R-18" in text                # x_restrict 解包后才是 1
+    assert "封面已模糊" in text
+    assert "さむしんぐ" in text          # 真作者名
+    assert "https://www.pixiv.net/novel/show.php?id=29277050" in text
+
+
+@pytest.mark.asyncio
+async def test_full_chain_r18_push_switch_blocks_real_fixture(monkeypatch):
+    """同一链路下关掉 R18 推送开关 → 真实 R18 fixture 必须一条都不推。
+
+    修复前 x_restrict 恒为 0，这条会**突破开关**被推出去。
+    """
+    import nonebot_plugin_pixiv_novel.pixiv_client as pc_mod
+    from nonebot_plugin_pixiv_novel.pixiv_client import PixivClient
+
+    raw_detail = load_fixture("novel_detail_r18.json")
+    raw_user_novels = load_fixture("user_novels.json")
+
+    class FakeAPI:
+        def __init__(self, **kwargs):
+            pass
+
+        def auth(self, refresh_token):
+            pass
+
+        def user_novels(self, author_id):
+            return raw_user_novels
+
+        def novel_detail(self, novel_id):
+            return raw_detail
+
+    monkeypatch.setattr(pc_mod, "AppPixivAPI", FakeAPI)
+
+    # 打桩，杜绝单测里发真实网络请求
+    async def _no_fetch(self, url):
+        raise AssertionError("R18 推送关闭时不该下载封面")
+
+    monkeypatch.setattr(PixivClient, "fetch_image", _no_fetch)
+
+    store.subscribe(100, 61943687, baseline=0)
+    store.set_last_seen(100, 61943687, 1)
+
+    n = await poller.poll_once(
+        PixivClient("tok", ""),
+        _cfg(pixiv_r18_push_enabled=False),
+        send=_noop_send, send_file=None,
+    )
+    assert n == 0
