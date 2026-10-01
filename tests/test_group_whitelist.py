@@ -55,6 +55,48 @@ def test_int_and_str_group_ids_both_match():
     assert policy.is_group_allowed(123, whitelist=[" 123 "]) is True
 
 
+# ── 群黑名单（2026-10-02 用户要求新增）──────────────────────────────
+
+
+def test_empty_blacklist_is_disabled_by_default():
+    """空黑名单 = 谁都不拉黑（默认），不是「全拒」。"""
+    assert policy.is_group_allowed(123, whitelist=[], blacklist=[]) is True
+    assert policy.is_group_allowed(999999, whitelist=[], blacklist=[]) is True
+
+
+def test_blacklisted_group_is_denied_with_empty_whitelist():
+    """用户的实际配置形态：**清空白名单 + 只拉黑一个群**。
+
+    也就是「不限制别的群，单独禁掉这一个」。白名单空了，拦人的只剩黑名单。
+    """
+    assert policy.is_group_allowed(1094538078, whitelist=[], blacklist=[1094538078]) is False
+    assert policy.is_group_allowed(868258211, whitelist=[], blacklist=[1094538078]) is True
+
+
+def test_blacklist_beats_whitelist():
+    """两份名单都命中同一个群时，**黑名单赢**。
+
+    这条是刻意的优先级：用户明确说「禁掉这个群」却被一条白名单悄悄推翻，
+    是最难查的一类「配置没生效」。
+    """
+    assert policy.is_group_allowed(123, whitelist=[123], blacklist=[123]) is False
+
+
+def test_blacklist_does_not_block_other_whitelisted_groups():
+    assert policy.is_group_allowed(456, whitelist=[123, 456], blacklist=[123]) is True
+
+
+def test_private_message_is_never_blocked_by_the_group_blacklist():
+    """私聊不是「群」，黑名单也不该管它（否则用户一拉黑就没法私聊取全文）。"""
+    assert policy.is_group_allowed(None, whitelist=[], blacklist=[123]) is True
+
+
+def test_blacklist_matches_int_and_str():
+    assert policy.is_group_allowed(123, whitelist=[], blacklist=["123"]) is False
+    assert policy.is_group_allowed("123", whitelist=[], blacklist=[123]) is False
+    assert policy.is_group_allowed(" 123 ", whitelist=[], blacklist=[123]) is False
+
+
 # ── 配置归一化 ────────────────────────────────────────────────────
 
 
@@ -75,6 +117,27 @@ def test_whitelist_drops_unparsable_items_instead_of_crashing():
     """
     cfg = Config(pixiv_group_whitelist=[123, "", "书友群456", 456])
     assert cfg.pixiv_group_whitelist == [123, 456]
+
+
+def test_blacklist_defaults_to_empty():
+    assert Config().pixiv_group_blacklist == []
+
+
+def test_blacklist_normalizes_like_the_whitelist():
+    """两份名单共用同一个校验器 —— 归一化行为必须完全一致。
+
+    不共用的话，黑名单很容易漏掉「字符串群号转 int」这一步，
+    于是 `.env` 里写 ["1094538078"] 就静默不生效（int 与 str 比不上）。
+    """
+    cfg = Config(pixiv_group_blacklist=["1094538078", 1094538078, " 123 "])
+    assert cfg.pixiv_group_blacklist == [1094538078, 123]
+
+
+def test_both_lists_are_independent():
+    """两个字段互不干扰（别把黑名单误塞进白名单）。"""
+    cfg = Config(pixiv_group_whitelist=[111], pixiv_group_blacklist=[222])
+    assert cfg.pixiv_group_whitelist == [111]
+    assert cfg.pixiv_group_blacklist == [222]
 
 
 # ── 静态接线断言（走 AST，不匹配源码字符串 —— 注释里的名字会骗人）────
@@ -219,3 +282,108 @@ async def test_excluded_group_has_its_watermark_advanced_no_backlog():
     await poller.poll_once(client, cfg, send=send, send_file=None)
 
     assert store.list_by_group(100)[0]["last_seen"] == 600
+
+
+# ── 推送过滤：黑名单 ───────────────────────────────────────────────
+
+
+async def test_poller_does_not_push_to_a_blacklisted_group():
+    """用户的实际配置：空白名单 + 拉黑一个群 → 该群不推送，别处照常。"""
+    store.subscribe(group_id=100, author_id=200, baseline=500)
+    client = FakeClient(
+        {200: [FakeNovel(600, title="新作600"), FakeNovel(500)]},
+        {600: FakeNovel(600, title="新作600")},
+    )
+    sent = []
+
+    async def send(gid, msg):
+        sent.append((gid, str(msg)))
+
+    cfg = _cfg(pixiv_group_blacklist=[100])
+    n = await poller.poll_once(client, cfg, send=send, send_file=None)
+
+    assert n == 0
+    assert sent == []
+
+
+async def test_poller_still_pushes_to_groups_not_in_the_blacklist():
+    """黑名单只拦名单内的群 —— 其余群「清空白名单」后照常推送。"""
+    store.subscribe(group_id=100, author_id=200, baseline=500)
+    client = FakeClient(
+        {200: [FakeNovel(600, title="新作600"), FakeNovel(500)]},
+        {600: FakeNovel(600, title="新作600")},
+    )
+    sent = []
+
+    async def send(gid, msg):
+        sent.append((gid, str(msg)))
+
+    cfg = _cfg(pixiv_group_blacklist=[999])
+    n = await poller.poll_once(client, cfg, send=send, send_file=None)
+
+    assert n == 1
+    assert [gid for gid, _ in sent] == [100]
+
+
+async def test_blacklisted_group_also_has_its_watermark_advanced():
+    """和排除群同理：高水位要跑掉，放行回来时不能一次性吐积压。"""
+    store.subscribe(group_id=100, author_id=200, baseline=500)
+    client = FakeClient(
+        {200: [FakeNovel(600), FakeNovel(550), FakeNovel(500)]},
+        {600: FakeNovel(600), 550: FakeNovel(550)},
+    )
+
+    async def send(gid, msg):
+        raise AssertionError("被拉黑的群不该收到任何推送")
+
+    cfg = _cfg(pixiv_group_blacklist=[100])
+    await poller.poll_once(client, cfg, send=send, send_file=None)
+
+    assert store.list_by_group(100)[0]["last_seen"] == 600
+
+
+# ── 黑名单也要真的被接线（不只是 policy 有参数）────────────────────
+
+
+def test_gate_passes_the_blacklist_to_the_policy():
+    """`_is_group_allowed` 必须把**两个**字段都传下去。
+
+    漏传黑名单的表现是「配了黑名单但完全不生效」—— 而 policy 那层的单测
+    全绿，因为它测的是 policy 自己。这类「参数没接上」只有静态接线断言能抓。
+    """
+    tree = source_introspect.plugin_tree()
+    fn = next(
+        node
+        for node in tree.body
+        # ⚠️ 这里用「函数定义」基类判定：`_is_group_allowed` 是**同步** def，
+        # 只匹配 AsyncFunctionDef 会 StopIteration（我第一版就踩了）。
+        if isinstance(node, source_introspect.FUNCTION_DEFS)
+        and node.name == "_is_group_allowed"
+    )
+    passed = {
+        kw.arg
+        for node in source_introspect.ast.walk(fn)
+        if isinstance(node, source_introspect.ast.Call)
+        for kw in node.keywords
+    }
+    assert "blacklist" in passed, "_is_group_allowed 没有把黑名单传给 policy"
+    assert "whitelist" in passed, "_is_group_allowed 没有把白名单传给 policy"
+
+
+async def test_gate_actually_denies_a_blacklisted_group(monkeypatch):
+    """端到端：改配置后闸门真的拒（而不是只有 policy 单测通过）。"""
+    from nonebot.adapters.onebot.v11 import GroupMessageEvent
+    from nonebot_plugin_pixiv_novel import _is_group_allowed, plugin_config
+
+    event = GroupMessageEvent.model_construct(group_id=1094538078, user_id=10001)
+
+    monkeypatch.setattr(plugin_config, "pixiv_group_whitelist", [])
+    monkeypatch.setattr(plugin_config, "pixiv_group_blacklist", [1094538078])
+    assert _is_group_allowed(event) is False
+
+    monkeypatch.setattr(plugin_config, "pixiv_group_blacklist", [])
+    assert _is_group_allowed(event) is True
+
+    # 生产形态：白名单清空 + 黑名单单个群 —— 别的群要照常可用
+    monkeypatch.setattr(plugin_config, "pixiv_group_blacklist", [999])
+    assert _is_group_allowed(event) is True

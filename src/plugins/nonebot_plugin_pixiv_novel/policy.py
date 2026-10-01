@@ -60,22 +60,38 @@ def is_admin(
     return is_admin_identity(user_id, admin_ids=admin_ids, superusers=superusers)
 
 
-def is_group_allowed(group_id: object, *, whitelist: Iterable[object]) -> bool:
-    """群白名单闸门：这个群能不能用插件。
+def is_group_allowed(
+    group_id: object,
+    *,
+    whitelist: Iterable[object],
+    blacklist: Iterable[object] = (),
+) -> bool:
+    """群白名单/黑名单闸门：这个群能不能用插件。
 
     判断顺序（**测试依赖这个顺序，不要改**）：
-        ① 白名单为空 → 放行（功能关闭）
-        ② 群号为 None（私聊）→ 放行（白名单管的是「群」）
-        ③ 群号在名单里 → 放行
+        ① 群号在黑名单里 → **拒绝**（黑名单优先于白名单）
+        ② 白名单为空 → 放行（功能关闭）
+        ③ 群号为 None（私聊）→ 放行（这两份名单管的是「群」）
+        ④ 群号在白名单里 → 放行
 
-    **空列表 = 关闭白名单，不是「谁都不许用」** —— 这是刻意的默认：
-    新装插件时不用先配群号就能用，配上群号才收紧。
-    （对照 `pixiv_text_targets` 的空列表是「都不受理」，两者语义相反，
-     因为那边是「允许名单」而这边是「限制名单」，别照搬。）
+    **空列表 = 关闭该名单**，不是「谁都不许用」/「谁都放行」：
+    - 白名单空 = 不限制（默认，新装即可用）；
+    - 黑名单空 = 不拉黑任何人（默认）。
+      （对照 `pixiv_text_targets` 的空列表是「都不受理」，语义相反 ——
+       那是「允许名单」而这里是「限制名单」，别照搬。）
+
+    黑名单排第一是刻意的：用户 2026-10-02 要求「清空白名单、把某个群设为黑名单」，
+    也就是「不限制别的群，单独禁掉这一个」。若白名单优先，那条配置会完全失效
+    （白名单空了本就不存在冲突），但一旦两者都填，语义必须是黑名单赢 ——
+    否则「我明确禁了这个群」会被一条白名单悄悄推翻。
 
     ⚠️ 两边都转 `str` 再比：NoneBot 的 `group_id` 是 int，而配置里可能
     写成字符串（用户手改 .env 时很常见），直接 `in` 比对会静默不匹配。
     """
+    denied = {str(x).strip() for x in blacklist}
+    if group_id is not None and str(group_id).strip() in denied:
+        return False
+
     allowed = {str(x).strip() for x in whitelist}
     if not allowed:
         return True

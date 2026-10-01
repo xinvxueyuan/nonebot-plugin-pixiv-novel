@@ -14,7 +14,7 @@ R18 相关有**三根互相独立的轴 + 一个非轴开关**（详见计划 §
 import logging
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 logger = logging.getLogger("nonebot_plugin_pixiv_novel")
 
@@ -97,8 +97,13 @@ class Config(BaseModel):
     # 私聊不受影响（白名单管的是「群」）。
     pixiv_group_whitelist: list[int] = Field(
         default_factory=list,
-        description="群白名单：只在这些群里启用插件。**空列表=关闭白名单**（全放行）；"
+        description="群白名单：**只**在这些群里启用插件。空列表=关闭白名单（全放行，默认）；"
         '填了就是白名单，如 [868258211]',
+    )
+    pixiv_group_blacklist: list[int] = Field(
+        default_factory=list,
+        description="群黑名单：这些群里**永不**启用插件（优先级高于白名单）。"
+        "空列表=关闭黑名单（默认）；如 [1094538078]",
     )
 
     # ---- 被动 URL hook：消息里出现 pixiv 小说链接就回卡片 ----
@@ -117,15 +122,19 @@ class Config(BaseModel):
         description="群内直接发出的正文上限；超过则改发 .txt 文件",
     )
 
-    @field_validator("pixiv_group_whitelist", mode="before")
+    @field_validator("pixiv_group_whitelist", "pixiv_group_blacklist", mode="before")
     @classmethod
-    def _normalize_whitelist(cls, v: object) -> object:
+    def _normalize_group_list(cls, v: object, info: ValidationInfo) -> object:
         """群号统一成 int 并去重，保留首次出现顺序；转不成 int 的项**丢弃**。
 
-        为什么不抛：白名单是「放行名单」，配置里混进一个手滑的字符（如空串、
-        带标注的 `123456(书友群)`）就让整个插件起不来，代价远大于丢掉那一项。
-        但**丢弃必须留痕**，否则用户会以为那个群被放行了却收不到任何推送。
+        为什么不抛：这类名单混进一个手滑的字符（如空串、带标注的 `123456(书友群)`）
+        就让整个插件起不来，代价远大于丢掉那一项。
+        但**丢弃必须留痕**，否则用户会以为那个群生效了却收不到任何推送。
+
+        白名单与黑名单共用这一份实现（命名按字段动态取，日志才不会把黑名单的
+        手滑项说成白名单的 —— 那会把人带偏到反方向去查）。
         """
+        field_name = getattr(info, "field_name", "group_list")
         if not isinstance(v, list):
             return v
         out: list[int] = []
@@ -133,7 +142,7 @@ class Config(BaseModel):
             try:
                 gid = int(str(item).strip())
             except (TypeError, ValueError):
-                logger.warning(f"PIXIV_GROUP_WHITELIST 里跳过无法解析为群号的项: {item!r}")
+                logger.warning(f"{field_name.upper()} 里跳过无法解析为群号的项: {item!r}")
                 continue
             if gid not in out:
                 out.append(gid)

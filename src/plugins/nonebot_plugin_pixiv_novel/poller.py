@@ -65,17 +65,19 @@ async def poll_once(
             group_id = sub["group_id"]
             last_seen = sub["last_seen"]
 
-            # ── 群白名单 ────────────────────────────────────────────────
-            # 不在白名单的群**完全不服务**：不推送，并把高水位一次推进到最新，
-            # 不留下任何积压。
+            # ── 群白名单 / 黑名单 ───────────────────────────────────────
+            # 被排除的群（不在白名单，或已被拉黑）**完全不服务**：不推送，
+            # 并把高水位一次推进到最新，不留下任何积压。
             #
             # 为什么是「推进」而不是「什么都不做」：若直接 continue，
-            # 用户把这个群重新加回白名单时，会把离线期间积压的旧作一次性推出来 ——
+            # 用户把这个群重新放行时，会把离线期间积压的旧作一次性推出来 ——
             # 与本插件「订阅前的历史作品不推送」的取向相反（也是刷屏）。
             # 这里一次性写到位而不是逐篇写，既省 DB 往返，也避免在
             # `landed` 永远为空的情况下把整份 fresh 列表逐条走一遍。
             if not policy.is_group_allowed(
-                group_id, whitelist=config.pixiv_group_whitelist
+                group_id,
+                whitelist=config.pixiv_group_whitelist,
+                blacklist=config.pixiv_group_blacklist,
             ):
                 store.set_last_seen(group_id, author_id, newest_id)
                 continue

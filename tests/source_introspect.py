@@ -22,6 +22,11 @@ _SRC = (
     / "__init__.py"
 )
 
+#: 函数定义节点的两种形态。**别只用 `AsyncFunctionDef`**：插件里有同步的
+#: `def`（如 `_is_group_allowed`、`_extract_message_id`），只匹配异步版
+#: 会在 `next(...)` 上抛 `StopIteration`（踩过）。
+FUNCTION_DEFS: tuple[type, ...] = (ast.FunctionDef, ast.AsyncFunctionDef)
+
 
 def plugin_tree() -> ast.Module:
     return ast.parse(_SRC.read_text(encoding="utf-8"))

@@ -83,7 +83,7 @@ from .poller import poll_once
 plugin_config = get_plugin_config(Config)
 
 DENIED_MSG = "此指令仅管理员可用"
-GROUP_DENIED_MSG = "本插件未在此群启用（不在群白名单内）"
+GROUP_DENIED_MSG = "本插件未在此群启用（不在群白名单内，或已被列入群黑名单）"
 
 # ── 全局客户端（refresh_token / 代理来自配置）──────────────────────
 client = PixivClient(
@@ -125,14 +125,17 @@ def _is_admin_identity(event: MessageEvent) -> bool:
 
 
 def _is_group_allowed(event: MessageEvent) -> bool:
-    """群白名单闸门：这个群能不能用插件。逻辑在 policy.is_group_allowed（纯函数，已单测）。
+    """群白名单/黑名单闸门：这个群能不能用插件。逻辑在 policy.is_group_allowed（纯函数，已单测）。
 
-    配额为空 = 白名单功能关闭、全放行（默认）。私聊不算「群」，不受白名单约束 ——
-    否的话用户配了白名单就再也没法私聊取全文了，而白名单的语义是「限制群」。
+    两份名单都为空 = 功能关闭、全放行（默认）。黑名单优先于白名单。
+    私聊不算「群」，不受这两份名单约束 ——
+    否的话用户配了名单就再也没法私聊取全文了，而它们管的是「限制群」。
     """
     group_id = event.group_id if isinstance(event, GroupMessageEvent) else None
     return policy.is_group_allowed(
-        group_id, whitelist=plugin_config.pixiv_group_whitelist
+        group_id,
+        whitelist=plugin_config.pixiv_group_whitelist,
+        blacklist=plugin_config.pixiv_group_blacklist,
     )
 
 
@@ -230,6 +233,7 @@ async def _startup() -> None:
         f"R18封面模糊={plugin_config.pixiv_blur_r18}(radius={plugin_config.pixiv_blur_radius}) "
         f"封面={plugin_config.pixiv_cover_max_width or '原图'} "
         f"群白名单={plugin_config.pixiv_group_whitelist or '关闭(全放行)'} "
+        f"群黑名单={plugin_config.pixiv_group_blacklist or '关闭'} "
         f"URL被动卡片={plugin_config.pixiv_url_hook_enabled}"
         f"(去重={plugin_config.pixiv_url_hook_cooldown}s)"
     )
@@ -401,9 +405,9 @@ async def _(event: MessageEvent):
     if not plugin_config.pixiv_url_hook_enabled:
         return
 
-    # 群白名单在最前，且**静默 return**：
-    # ① 不在白名单的群不该回卡片；② 更不该冒出 🔨/✅ 表态表情 ——
-    #    所以表态必须在这个闸门**之内**（见下面的 _build_card_with_reaction），
+    # 群白名单/黑名单在最前，且**静默 return**：
+    # ① 被排除的群不该回卡片；② 更不该冒出 🔨/🍼 表情 ——
+    #    所以表态必须在这个闸门**之内**（见下面的 _card_flow），
     #    而不是用装饰器包住整个 handler（那样闸门一过就已经打了「处理中」）。
     if not _is_group_allowed(event):
         return
@@ -424,25 +428,42 @@ async def _(event: MessageEvent):
 
     logger.info(f"URL hook 命中：{kind}={target_id} 会话={key[0]}")
 
-    # 🔨 从这一步开始 —— 表态只包住「真正慢的那段」（打 pixiv 接口 + 下图），
-    # 校验/去重这些毫秒级判断放在外面，不必惊动用户。
+    # 🔨 表态、拉卡片、发卡片都在 `_card_flow` 里（它被 @with_reaction 包住）。
+    # 只把「真正慢的那段」+ 发送放进去；校验/去重这些毫秒级判断留在外面。
     try:
-        msg = await _build_card_with_reaction(kind, target_id)
+        await _card_flow(kind, target_id)
     except Exception as e:
-        # ── 这里不吞异常、也不在这里 finish ────────────────────────────
-        # 让异常穿出 `_build_card_with_reaction`，库里的 with_reaction 才会
-        # 打到 ❌；若在这里就 finish，异常变成控制流（FinishedException），
-        # 表态会被判成「成功」，出错时反而显示 ✅。
-        logger.warning(f"URL hook 取 {kind}={target_id} 失败: {type(e).__name__}: {e}")
-        await url_hook.finish(f"取 {kind} {target_id} 失败，确认链接是否有效")
-        return
+        # 失败文案已经由 `_card_flow` 发出（若连发送都失败则没有），
+        # ❌ 也已由装饰器打过。这里只剩记录：再 finish 一次会多出一条消息。
+        logger.warning(f"URL hook 处理 {kind}={target_id} 结束于异常: {type(e).__name__}: {e}")
+
+    # 收尾 finish：保持「这条消息已被本 hook 消费」的语义（block=False，
+    # 不 finish 就会继续传给更低优先级的 matcher，别的插件可能会再解析一遍）。
+    await url_hook.finish()
+
+
+@with_reaction
+async def _card_flow(kind: str, target_id: int) -> None:
+    """拉卡片 → 发出。三态表态（🔨 → 🍼/❌）由装饰器负责。
+
+    ⚠️ **发送动作必须在被装饰的函数内**：装饰器只在函数返回/抛出时才打终态，
+    而用户要求「表态发生在消息发完之后」（2026-10-02）。所以发送得放在这里。
+
+    ⚠️ 失败时用 `send` 回文案后**再 `raise`**，不要用 `finish()`：
+    `finish()` 抛的 `FinishedException` 属于 `MatcherException`，库会判成「成功」，
+    于是出错反而显示 🍼。抛真异常才会让装饰器打 ❌。
+    """
+    try:
+        msg = await _build_card(kind, target_id)
+    except Exception:
+        await url_hook.send(f"取 {kind} {target_id} 失败，确认链接是否有效")
+        raise
 
     await _send_card_and_remember(kind, target_id, msg)
 
 
-@with_reaction
-async def _build_card_with_reaction(kind: str, target_id: int) -> Message:
-    """拉卡片内容（慢：要打 pixiv 接口、下封面原图）。三态表态由装饰器负责。"""
+async def _build_card(kind: str, target_id: int) -> Message:
+    """拼卡片内容（慢：要打 pixiv 接口、下封面原图）。表态由调用方的装饰器负责。"""
     if kind == "novel":
         return await _build_novel_card(target_id)
     return await _build_series_card(target_id)
@@ -451,8 +472,9 @@ async def _build_card_with_reaction(kind: str, target_id: int) -> Message:
 async def _send_card_and_remember(kind: str, target_id: int, msg: Message) -> None:
     """发卡片，并记下「这条消息讲的是哪个作品」，供之后引用时定位。
 
-    ⚠️ 先 `send` 再 `finish`：`finish()` 会抛 `FinishedException`，
-    拿不到发送响应的 message_id。而响应里才有我们需要的 id。
+    ⚠️ 这里**只 send、不 finish**：调用方（`_card_flow`）要在发送**之后**才打
+    终态表态，而 `finish()` 会抛 `FinishedException` 直接把控制流带走 ——
+    表态就得写在它前面，顺序又反了。收尾的 finish 在 handler 里。
     """
     res: Any = None
     try:
@@ -470,8 +492,6 @@ async def _send_card_and_remember(kind: str, target_id: int, msg: Message) -> No
             logger.warning(f"记录卡片映射失败: {type(e).__name__}: {e}")
     else:
         logger.warning(f"发送卡片未拿到 message_id，引用取全文将不可用: {res!r}")
-
-    await url_hook.finish()
 
 
 def _extract_message_id(res: Any) -> int | None:
@@ -559,7 +579,12 @@ async def _(event: MessageEvent, args: Message = CommandArg()):
         if novel_id is None:
             return  # _resolve_id_from_quote 已经回过文案了
 
-    await _deliver_full_text(event, novel_id)
+    try:
+        await _deliver_full_text(event, novel_id)
+    except Exception as e:
+        # 失败文案与 ❌ 都已经发过（见 `_deliver_full_text`），这里只记录，
+        # 免得真异常直接冒到 NoneBot 层被打成 Traceback。
+        logger.warning(f"获取全文 {novel_id} 结束于异常: {type(e).__name__}: {e}")
 
 
 async def _resolve_id_from_quote(event: MessageEvent) -> int | None:
@@ -598,11 +623,11 @@ async def _resolve_id_from_quote(event: MessageEvent) -> int | None:
     return None
 
 
-@with_reaction
 async def _fetch_detail_and_text(event: MessageEvent, novel_id: int) -> tuple[Any, str, str]:
     """拉详情 → 判投递策略 → 拉正文。返回 `(详情, 正文, 拒绝原因)`。
 
-    被**同一对** 🔨/✅/❌ 包住整段（两次网络往返），而不是每步各表一次态 ——
+    **不负责表态**：由调用它的 `_deliver_full_text` 统一包住整段（两次网络往返
+    共用一对 🔨/🍼/❌），而不是每步各表一次态 ——
     否则群里会闪两个「处理中→完成」回合，看起来像出了两次问题。
 
     策略判定留在函数内（而不是外层）是为了让它同在这一对表态之间；
@@ -631,33 +656,50 @@ async def _fetch_detail_and_text(event: MessageEvent, novel_id: int) -> tuple[An
     return detail, (await client.novel_text(novel_id)).strip(), ""
 
 
+@with_reaction
 async def _deliver_full_text(event: MessageEvent, novel_id: int) -> None:
-    """取详情+正文并交付（三级降级）。异常已在这里转成给用户看得懂的文案。"""
+    """取详情+正文 → 交付（三级降级）。三态表态由装饰器负责。
+
+    ⚠️ **交付动作必须发生在这个函数内**：装饰器只在函数返回/抛出时才打终态，
+    而用户要求「表态发生在消息发完之后」（2026-10-02）。所以把发送放进来。
+
+    ⚠️ 失败用 `send` + `raise`，不要 `finish()`：`FinishedException` 属于
+    `MatcherException`，会被库判成「成功」而显示 🍼。
+    """
     try:
         detail, text, denied_reason = await _fetch_detail_and_text(event, novel_id)
     except Exception as e:
         logger.warning(f"取作品 {novel_id} 失败: {type(e).__name__}: {e}")
-        await text_cmd.finish(f"取作品 {novel_id} 失败，确认 ID 是否正确（或稍后重试）")
-        return
+        await text_cmd.send(f"取作品 {novel_id} 失败，确认 ID 是否正确（或稍后重试）")
+        raise
 
     if denied_reason:
-        await text_cmd.finish(denied_reason)
+        await text_cmd.send(denied_reason)
+        return
 
     if not text:
-        await text_cmd.finish(f"这篇作品没有正文内容：{novel_url(novel_id)}")
+        await text_cmd.send(f"这篇作品没有正文内容：{novel_url(novel_id)}")
         return
 
     filename = handlers.safe_filename(novel_id, detail.title)
 
     # 交付：内联 / 文件 / 链接 三级降级（逻辑在 handlers 里，可单测）
-    used = await handlers.deliver_novel_text(
-        text=text,
-        title=detail.title,
-        novel_id=novel_id,
-        filename=filename,
-        max_chars=plugin_config.pixiv_text_max_chars,
-        send_text=lambda msg: text_cmd.send(msg),
-        send_file=lambda fn, body: _send_file(event, fn, body),
-    )
+    try:
+        used = await handlers.deliver_novel_text(
+            text=text,
+            title=detail.title,
+            novel_id=novel_id,
+            filename=filename,
+            max_chars=plugin_config.pixiv_text_max_chars,
+            send_text=lambda msg: text_cmd.send(msg),
+            send_file=lambda fn, body: _send_file(event, fn, body),
+        )
+    except Exception as e:
+        # 三级降级全挂=正文没送出去。必须**先回一条能用的链接再上抛**：
+        # ① 用户至少拿得到东西，不至于对着一屏沉默；② 终态表态（❌）在异常
+        #    上抛后才由装饰器打出，于是「先消息、后表态」的顺序在失败路径上也成立。
+        logger.warning(f"作品 {novel_id} 正文交付失败: {type(e).__name__}: {e}")
+        await text_cmd.send(f"正文发送失败，可用链接直接看：{novel_url(novel_id)}")
+        raise
+
     logger.info(f"作品 {novel_id} 正文交付方式: {used}")
-    await text_cmd.finish()
