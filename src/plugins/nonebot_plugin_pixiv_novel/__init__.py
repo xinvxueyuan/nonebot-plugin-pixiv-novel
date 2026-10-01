@@ -27,9 +27,25 @@ from nonebot.adapters.onebot.v11 import (
     MessageEvent,
     MessageSegment,
 )
+from nonebot.log import LoguruHandler
 from nonebot.params import CommandArg
 
 logger = logging.getLogger("nonebot_plugin_pixiv_novel")
+
+# NoneBot 把 stdlib `logging` 的 root logger 钉在 WARNING，且 root **没有任何 handler**
+# （实测 `root level: 30` / `root handlers: []`），所以本插件的 `logger.info(...)`
+# **一条都不会出现在 journal 里** —— 只有 warning 靠 logging 的 lastResort 落到 stderr。
+# 后果是启动行「已启动：代理=… 间隔=…」和推送通知全都看不见，出事时无从判断。
+#
+# 修法：挂上 NoneBot 自带的 `LoguruHandler`（stdlib logging → loguru 的官方桥），
+# 并把本 logger 的级别降到 INFO。6 个模块用的都是**同一个** logger 名字，
+# 所以这两行一次覆盖全部。
+#   · 加了 handler 之后 warning 不会重复（有 handler 就不会走 lastResort）
+#   · debug 仍按 INFO 级别过滤掉
+# 实测见 scripts/verify_log_visibility.py。
+if not any(isinstance(h, LoguruHandler) for h in logger.handlers):
+    logger.addHandler(LoguruHandler())
+logger.setLevel(logging.INFO)
 
 require("nonebot_plugin_apscheduler")
 require("nonebot_plugin_localstore")
