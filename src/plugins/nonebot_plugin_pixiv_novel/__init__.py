@@ -29,9 +29,30 @@ from nonebot.adapters.onebot.v11 import (
 )
 from nonebot.params import CommandArg
 
+logger = logging.getLogger("nonebot_plugin_pixiv_novel")
+
 require("nonebot_plugin_apscheduler")
 require("nonebot_plugin_localstore")
-require("nonebot_plugin_htmlkit")   # ⚠️ htmlkit 要求先 require 再 import
+
+# ⚠️ htmlkit 是**可选**依赖，必须用 try 包住。
+#
+# `require()` 内部会 `load_plugin()` 并把异常**原样抛出**，所以一旦 htmlkit 在某台机器上
+# 加载不了（C++ 扩展缺 .so / glibc 太老 / 没装），这一行会让**整个 pixiv 插件**加载失败 ——
+# 4 个命令全部消失，连「不依赖 htmlkit 的」订阅/退订/获取全文 都跟着没法用。
+# 实测确认过这个失败模式（scripts/verify_htmlkit_resilience.py）。
+#
+# 正确行为：htmlkit 不可用 → 插件照常加载 → 只有「订阅列表」降级成纯文本。
+# render.py 里的 `_load_htmlkit()` 是惰性 import，`render_subscription_list()`
+# 会捕获异常返回 None，由调用方回退 `handlers.reply_list()`。
+HTMLKIT_AVAILABLE = True
+try:
+    require("nonebot_plugin_htmlkit")   # htmlkit 要求先 require 再 import
+except Exception as e:
+    HTMLKIT_AVAILABLE = False
+    logger.warning(
+        f"nonebot_plugin_htmlkit 加载失败，订阅列表将回退为纯文本列表："
+        f"{type(e).__name__}: {e}"
+    )
 
 from nonebot_plugin_apscheduler import scheduler
 
@@ -40,8 +61,6 @@ from .config import Config
 from .message import novel_url
 from .pixiv_client import PixivClient
 from .poller import poll_once
-
-logger = logging.getLogger("nonebot_plugin_pixiv_novel")
 
 plugin_config = get_plugin_config(Config)
 
