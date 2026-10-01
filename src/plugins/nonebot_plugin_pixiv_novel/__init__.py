@@ -181,25 +181,32 @@ async def _(event: GroupMessageEvent, args: Message = CommandArg()):
     if not _is_admin(event):
         await subscribe_cmd.finish(DENIED_MSG)
 
+    # `finish()` 声明为 NoReturn（会抛 FinishedException），但 Pyright 不认
+    # `await` 形式的 NoReturn 收窄，所以补一个显式 return 让控制流和类型都明确。
     author_id = handlers.extract_id(args.extract_plain_text())
     if author_id is None:
         await subscribe_cmd.finish("用法：订阅 <作者id>（也可直接粘作者主页链接）")
+        return
 
     # 播种：取作者当前最新作品 ID，避免把历史作品一次性推出来
     baseline = 0
     author_name = ""
     author_avatar_url = ""
+    author_fetch_failed = False
     if plugin_config.pixiv_refresh_token:
         try:
             novels = await client.user_novels(author_id)
             if novels:
                 baseline = max(int(n.id) for n in novels)
-        except Exception as e:
-            logger.warning(f"订阅时取作者 {author_id} 作品列表失败: {e}")
 
-        # 顺手把作者名/头像存下来，供订阅列表显示（§2.5）。
-        # author_info 内部已容错：取不到就返回 ("", "")，不影响订阅本身。
-        author_name, author_avatar_url = await client.author_info(author_id)
+            # 顺手把作者名/头像存下来，供订阅列表显示（§2.5）。
+            # author_info 内部已容错：取不到就返回 ("", "")，不影响订阅本身。
+            author_name, author_avatar_url = await client.author_info(author_id)
+        except Exception as e:
+            # 拉不到 = 作者 ID 很可能不存在（或代理挂了）。
+            # 必须把这个事实带回回复里，否则用户看到「✅ 已订阅」却永远收不到推送。
+            author_fetch_failed = True
+            logger.warning(f"订阅时取作者 {author_id} 作品列表失败: {type(e).__name__}: {e}")
 
     await subscribe_cmd.finish(
         handlers.reply_subscribe(
@@ -208,6 +215,7 @@ async def _(event: GroupMessageEvent, args: Message = CommandArg()):
             baseline,
             author_name=author_name,
             author_avatar_url=author_avatar_url,
+            author_fetch_failed=author_fetch_failed,
         )
     )
 
@@ -224,6 +232,7 @@ async def _(event: GroupMessageEvent, args: Message = CommandArg()):
     author_id = handlers.extract_id(args.extract_plain_text())
     if author_id is None:
         await unsubscribe_cmd.finish("用法：退订 <作者id>")
+        return
     await unsubscribe_cmd.finish(handlers.reply_unsubscribe(event.group_id, author_id))
 
 
@@ -273,6 +282,7 @@ async def _(event: MessageEvent, args: Message = CommandArg()):
     novel_id = handlers.extract_id(args.extract_plain_text())
     if novel_id is None:
         await text_cmd.finish("用法：获取全文 <作品id>（也可直接粘小说链接）")
+        return
 
     # 先取详情：① 校验 ID ② 拿 x_restrict 给投递决策用
     try:
@@ -310,7 +320,7 @@ async def _(event: MessageEvent, args: Message = CommandArg()):
         await text_cmd.finish(f"📖 {detail.title}\n{novel_url(novel_id)}\n\n{text}")
 
     # 太长 → 发 txt 文件；上传失败就退化成发链接
-    filename = f"{novel_id}_{detail.title[:20]}.txt".replace("/", "_")
+    filename = handlers.safe_filename(novel_id, detail.title)
     if await _send_file(event, filename, text):
         await text_cmd.finish(f"📖 {detail.title}\n正文过长（{len(text)} 字），已作为 txt 文件发送")
     await text_cmd.finish(
