@@ -24,6 +24,27 @@ nonebot.get_driver().register_adapter(Adapter)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
+# ── 表态库（可选依赖）的本地解析 ──────────────────────────────────
+#
+# 插件把 `nonebot-plugin-message-reaction` 当**可选依赖**：库不在时功能照跑，
+# 只是没有表情反馈（`__init__.py` 里有降级替身）。
+#
+# 但「可选」不等于「不用测」—— 加载期那次 `from ... import with_reaction` 一旦
+# 失败，插件会**静默**退到替身，于是所有表态接线断言都会在「库其实没装上」的
+# 情况下照样通过（假绿）。所以这里在 import 插件**之前**把兄弟仓库挂上 sys.path，
+# 让本地/能拿到两份源码的环境真的走到库那一条分支。
+#
+# 找不到就什么都不做 —— 没有库的环境下相关测试用 importorskip 跳过，
+# 而不是把整仓测试弄红。
+_REACTION_SRC = (
+    Path(__file__).resolve().parents[2] / "nonebot-plugin-message-reaction" / "src" / "plugins"
+)
+if _REACTION_SRC.is_dir():
+    import sys
+
+    if str(_REACTION_SRC) not in sys.path:
+        sys.path.append(str(_REACTION_SRC))
+
 
 class FakeJsonDict(dict):
     """复刻 pixivpy3 `JsonDict` 的**关键语义**：缺失的键返回 `None`，**不抛异常**。

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Any
 
 from nonebot import get_bot, get_driver, get_plugin_config, on_command, on_message, require
 from nonebot.adapters.onebot.v11 import (
@@ -75,13 +76,14 @@ from nonebot_plugin_apscheduler import scheduler
 
 from . import avatars, handlers, message, policy, render, store, urls
 from .config import Config
-from .message import novel_url
+from .message import novel_url, series_url
 from .pixiv_client import PixivClient, original_cover_url
 from .poller import poll_once
 
 plugin_config = get_plugin_config(Config)
 
 DENIED_MSG = "此指令仅管理员可用"
+GROUP_DENIED_MSG = "本插件未在此群启用（不在群白名单内）"
 
 # ── 全局客户端（refresh_token / 代理来自配置）──────────────────────
 client = PixivClient(
@@ -120,6 +122,45 @@ def _is_admin_identity(event: MessageEvent) -> bool:
         admin_ids=plugin_config.pixiv_admin_ids,
         superusers=list(get_driver().config.superusers),
     )
+
+
+def _is_group_allowed(event: MessageEvent) -> bool:
+    """群白名单闸门：这个群能不能用插件。逻辑在 policy.is_group_allowed（纯函数，已单测）。
+
+    配额为空 = 白名单功能关闭、全放行（默认）。私聊不算「群」，不受白名单约束 ——
+    否的话用户配了白名单就再也没法私聊取全文了，而白名单的语义是「限制群」。
+    """
+    group_id = event.group_id if isinstance(event, GroupMessageEvent) else None
+    return policy.is_group_allowed(
+        group_id, whitelist=plugin_config.pixiv_group_whitelist
+    )
+
+
+# ── 表情表态（可选依赖）────────────────────────────────────────────
+#
+# 慢操作（拉卡片、取全文）期间群里毫无动静，用户会以为 bot 死了 —— 用户要求
+# 这些操作都要有「处理中 / 完成 / 失败」三态表情反馈。实现抽成了独立工具库
+# `nonebot-plugin-message-reaction`（LLBot 上走 alconna uniseg → set_msg_emoji_like）。
+#
+# ⚠️ 这里**必须是可选依赖**：库没装（或它依赖的 alconna 不可用）时插件要照常工作，
+# 只是没有表态。表态是锦上添花，绝不能让「库缺失」表现成「整个插件加载失败」。
+reaction_available = True
+try:
+    from nonebot_plugin_message_reaction import message_reaction, with_reaction
+except Exception as e:
+    reaction_available = False
+    logger.info(
+        f"表态库 nonebot-plugin-message-reaction 不可用，本次不带表情反馈："
+        f"{type(e).__name__}: {e}"
+    )
+
+    def message_reaction(event: MessageEvent, status: str) -> bool:
+        """降级替身：永远返回「没发出」，调用方无需感知库是否存在。"""
+        return False
+
+    def with_reaction(func):
+        """降级替身：直接透传被装饰的函数。"""
+        return func
 
 
 async def _send(group_id: int, message: Message) -> None:
@@ -188,6 +229,7 @@ async def _startup() -> None:
         f"R18推送={plugin_config.pixiv_r18_push_enabled} "
         f"R18封面模糊={plugin_config.pixiv_blur_r18}(radius={plugin_config.pixiv_blur_radius}) "
         f"封面={plugin_config.pixiv_cover_max_width or '原图'} "
+        f"群白名单={plugin_config.pixiv_group_whitelist or '关闭(全放行)'} "
         f"URL被动卡片={plugin_config.pixiv_url_hook_enabled}"
         f"(去重={plugin_config.pixiv_url_hook_cooldown}s)"
     )
@@ -213,6 +255,11 @@ subscribe_cmd = on_command("订阅", priority=10, block=True)
 
 @subscribe_cmd.handle()
 async def _(event: GroupMessageEvent, args: Message = CommandArg()):
+    # 群白名单在**管理员闸门之前**：不在白名单的群，管理员也不该能用 ——
+    # 否则「白名单」就只限制了普通群友，等于没限制。
+    if not _is_group_allowed(event):
+        await subscribe_cmd.finish(GROUP_DENIED_MSG)
+
     if not _is_admin(event):
         await subscribe_cmd.finish(DENIED_MSG)
 
@@ -261,6 +308,9 @@ unsubscribe_cmd = on_command("退订", priority=10, block=True)
 
 @unsubscribe_cmd.handle()
 async def _(event: GroupMessageEvent, args: Message = CommandArg()):
+    if not _is_group_allowed(event):
+        await unsubscribe_cmd.finish(GROUP_DENIED_MSG)
+
     if not _is_admin(event):
         await unsubscribe_cmd.finish(DENIED_MSG)
 
@@ -277,6 +327,9 @@ list_cmd = on_command("订阅列表", priority=10, block=True)
 
 @list_cmd.handle()
 async def _(event: GroupMessageEvent):
+    if not _is_group_allowed(event):
+        await list_cmd.finish(GROUP_DENIED_MSG)
+
     if not _is_admin(event):
         await list_cmd.finish(DENIED_MSG)
 
@@ -348,6 +401,13 @@ async def _(event: MessageEvent):
     if not plugin_config.pixiv_url_hook_enabled:
         return
 
+    # 群白名单在最前，且**静默 return**：
+    # ① 不在白名单的群不该回卡片；② 更不该冒出 🔨/✅ 表态表情 ——
+    #    所以表态必须在这个闸门**之内**（见下面的 _build_card_with_reaction），
+    #    而不是用装饰器包住整个 handler（那样闸门一过就已经打了「处理中」）。
+    if not _is_group_allowed(event):
+        return
+
     # 机器人自己的消息（含它刚发出的卡片）—— 不跳过就会自我触发
     if str(event.user_id) == str(event.self_id):
         return
@@ -364,17 +424,78 @@ async def _(event: MessageEvent):
 
     logger.info(f"URL hook 命中：{kind}={target_id} 会话={key[0]}")
 
+    # 🔨 从这一步开始 —— 表态只包住「真正慢的那段」（打 pixiv 接口 + 下图），
+    # 校验/去重这些毫秒级判断放在外面，不必惊动用户。
     try:
-        if kind == "novel":
-            msg = await _build_novel_card(target_id)
-        else:
-            msg = await _build_series_card(target_id)
+        msg = await _build_card_with_reaction(kind, target_id)
     except Exception as e:
+        # ── 这里不吞异常、也不在这里 finish ────────────────────────────
+        # 让异常穿出 `_build_card_with_reaction`，库里的 with_reaction 才会
+        # 打到 ❌；若在这里就 finish，异常变成控制流（FinishedException），
+        # 表态会被判成「成功」，出错时反而显示 ✅。
         logger.warning(f"URL hook 取 {kind}={target_id} 失败: {type(e).__name__}: {e}")
         await url_hook.finish(f"取 {kind} {target_id} 失败，确认链接是否有效")
         return
 
-    await url_hook.finish(msg)
+    await _send_card_and_remember(kind, target_id, msg)
+
+
+@with_reaction
+async def _build_card_with_reaction(kind: str, target_id: int) -> Message:
+    """拉卡片内容（慢：要打 pixiv 接口、下封面原图）。三态表态由装饰器负责。"""
+    if kind == "novel":
+        return await _build_novel_card(target_id)
+    return await _build_series_card(target_id)
+
+
+async def _send_card_and_remember(kind: str, target_id: int, msg: Message) -> None:
+    """发卡片，并记下「这条消息讲的是哪个作品」，供之后引用时定位。
+
+    ⚠️ 先 `send` 再 `finish`：`finish()` 会抛 `FinishedException`，
+    拿不到发送响应的 message_id。而响应里才有我们需要的 id。
+    """
+    res: Any = None
+    try:
+        res = await url_hook.send(msg)
+    except Exception as e:
+        logger.warning(f"发送卡片失败: {type(e).__name__}: {e}")
+
+    message_id = _extract_message_id(res)
+    if message_id is not None:
+        try:
+            store.remember_card(message_id, kind, target_id)
+        except Exception as e:
+            # 记不上只影响「引用卡片取全文」这个便利功能，卡片本身已经发出去了，
+            # 绝不能因为落库失败去报错或重发。
+            logger.warning(f"记录卡片映射失败: {type(e).__name__}: {e}")
+    else:
+        logger.warning(f"发送卡片未拿到 message_id，引用取全文将不可用: {res!r}")
+
+    await url_hook.finish()
+
+
+def _extract_message_id(res: Any) -> int | None:
+    """从 `send()` 的响应里取 message_id。
+
+    OneBot 适配器的 `Bot.send()` 返回的是响应的 **`data` 字段**
+    （形如 `{"message_id": 123, "res_id": ...}`）。但响应形状终究是实现定义的，
+    所以三种形状都兼容，取不到返回 None（调用方降级，不抛）。
+    """
+    candidate = res.get("message_id") if isinstance(res, dict) else None
+    if candidate is None:
+        # 嵌套形状：`res` 可能是整个响应体（形如 {"status":..,"data":{"message_id":..}}），
+        # 也可能是带 `.data` 属性的对象。dict 要用 [] 取，不能只写 getattr ——
+        # 普通 dict **没有** `.data` 属性，那样写会让嵌套形状静默取不到（实测被测试抓到）。
+        data = res.get("data") if isinstance(res, dict) else getattr(res, "data", None)
+        if isinstance(data, dict):
+            candidate = data.get("message_id")
+    if candidate is None:
+        return None
+    try:
+        mid = int(str(candidate).strip())
+    except (TypeError, ValueError):
+        return None
+    return mid or None
 
 
 async def _fetch_cover(url: str, x_restrict: int) -> tuple[bytes, bool]:
@@ -423,25 +544,74 @@ text_cmd = on_command("获取全文", priority=10, block=True)
 
 @text_cmd.handle()
 async def _(event: MessageEvent, args: Message = CommandArg()):
+    if not _is_group_allowed(event):
+        await text_cmd.finish(GROUP_DENIED_MSG)
+
     if not _is_admin(event):
         await text_cmd.finish(DENIED_MSG)
 
+    # ① 显式给了 ID/链接就用它
+    novel_id = handlers.extract_id(args.extract_plain_text())
+
+    # ② 没给参数 + 引用了消息 → 看那条消息是不是机器人发的作品卡片
+    if novel_id is None:
+        novel_id = await _resolve_id_from_quote(event)
+        if novel_id is None:
+            return  # _resolve_id_from_quote 已经回过文案了
+
+    await _deliver_full_text(event, novel_id)
+
+
+async def _resolve_id_from_quote(event: MessageEvent) -> int | None:
+    """从「引用的消息」里解析出作品 ID。解析不出来时**自己回文案**并返回 None。
+
+    用户需求原文：「实现用户发送『获取全文』且引用被动解析消息后自动识别获取」。
+    实现方式是**查表**（发卡片时用 message_id 记了作品），不解析引用内容 ——
+    引用段里内嵌的原文可能是空的，解析内容就得再打一次 API，多一层失败点。
+    """
+    reply_id = handlers.reply_message_id(event)
+    if reply_id is None:
+        await text_cmd.finish("用法：获取全文 <作品id>（也可直接粘小说链接，或引用我发的作品卡片）")
+        return None
+
+    row = store.lookup_card(reply_id)
+    if row is None:
+        await text_cmd.finish(
+            "这条引用我不认识 —— 请引用**我发的作品卡片**，或直接发 `获取全文 <作品id>`"
+        )
+        return None
+
+    kind = str(row["kind"])
+    target_id = int(row["target_id"])
+
+    if kind == "novel":
+        logger.info(f"获取全文：引用卡片解析出作品 {target_id}")
+        return target_id
+
+    # 系列卡片：一整个系列有很多篇，「全文」取哪一篇没有唯一答案，
+    # 所以不做猜测（猜错会把不相干的一篇发给用户），直接把选择权交回去。
+    await text_cmd.finish(
+        f"这条卡片是**系列**（共多篇），我不替你猜哪一篇。\n"
+        f"请用 `获取全文 <作品id>`，或点开系列后引用具体那一篇的卡片。\n"
+        f"系列地址：{series_url(target_id)}"
+    )
+    return None
+
+
+@with_reaction
+async def _fetch_detail_and_text(event: MessageEvent, novel_id: int) -> tuple[Any, str, str]:
+    """拉详情 → 判投递策略 → 拉正文。返回 `(详情, 正文, 拒绝原因)`。
+
+    被**同一对** 🔨/✅/❌ 包住整段（两次网络往返），而不是每步各表一次态 ——
+    否则群里会闪两个「处理中→完成」回合，看起来像出了两次问题。
+
+    策略判定留在函数内（而不是外层）是为了让它同在这一对表态之间；
+    被拒绝时 `text` 为空、`denied_reason` 非空，外层只回文案。
+    """
     channel = "group" if isinstance(event, GroupMessageEvent) else "private"
 
-    novel_id = handlers.extract_id(args.extract_plain_text())
-    if novel_id is None:
-        await text_cmd.finish("用法：获取全文 <作品id>（也可直接粘小说链接）")
-        return
-
-    # 先取详情：① 校验 ID ② 拿 x_restrict 给投递决策用
-    try:
-        detail = await client.novel_detail(novel_id)
-    except Exception as e:
-        logger.warning(f"取作品 {novel_id} 详情失败: {e}")
-        await text_cmd.finish(f"取作品 {novel_id} 失败，确认 ID 是否正确")
-        return
-
     # ⚠️ R18 判定必须来自 novel_detail（novel_text 返回的 WebviewNovel 没有 x_restrict）
+    detail = await client.novel_detail(novel_id)
     x_restrict = int(getattr(detail, "x_restrict", 0) or 0)
 
     allowed, reason = policy.decide_text_delivery(
@@ -456,16 +626,23 @@ async def _(event: MessageEvent, args: Message = CommandArg()):
         is_admin=_is_admin_identity(event),
     )
     if not allowed:
-        await text_cmd.finish(reason)
+        return detail, "", reason
 
+    return detail, (await client.novel_text(novel_id)).strip(), ""
+
+
+async def _deliver_full_text(event: MessageEvent, novel_id: int) -> None:
+    """取详情+正文并交付（三级降级）。异常已在这里转成给用户看得懂的文案。"""
     try:
-        text = await client.novel_text(novel_id)
+        detail, text, denied_reason = await _fetch_detail_and_text(event, novel_id)
     except Exception as e:
-        logger.warning(f"取作品 {novel_id} 全文失败: {e}")
-        await text_cmd.finish(f"取全文失败：{novel_url(novel_id)}")
+        logger.warning(f"取作品 {novel_id} 失败: {type(e).__name__}: {e}")
+        await text_cmd.finish(f"取作品 {novel_id} 失败，确认 ID 是否正确（或稍后重试）")
         return
 
-    text = text.strip()
+    if denied_reason:
+        await text_cmd.finish(denied_reason)
+
     if not text:
         await text_cmd.finish(f"这篇作品没有正文内容：{novel_url(novel_id)}")
         return

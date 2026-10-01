@@ -20,6 +20,10 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
     "ruff>=0.6.0",
+    # 表态库（nonebot-plugin-message-reaction）走 alconna uniseg 发表情，
+    # 所以「表态接线」的集成测试需要它。库本身是**可选依赖**（宿主以 git 子模块提供，
+    # 不在 PyPI，所以不能写进 [project.optional-dependencies] —— 那会让 uv lock 去 PyPI 找它而失败）。
+    "nonebot-plugin-alconna>=0.56.0",
 ]
 
 [tool.nonebot]

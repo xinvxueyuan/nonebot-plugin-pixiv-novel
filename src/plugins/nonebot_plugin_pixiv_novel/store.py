@@ -18,6 +18,13 @@ from collections.abc import Iterator
 from pathlib import Path
 
 _TABLE = "subscription"
+_CARD_TABLE = "card_message"
+
+# 卡片映射的保留期：超过这个时间的行在下次写入时清掉。
+# 为什么要有保留期：这张表只服务「用户引用机器人刚发的卡片」，
+# 引用总是发生在几分钟内；留着不清理会无限增长，且过期映射还可能
+# 指向一个早已被撤回的消息，让「获取全文」答非所问。
+_CARD_TTL_SECONDS = 7 * 24 * 3600
 
 # 建表语句（全新库）
 _SCHEMA = f"""
@@ -29,6 +36,12 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     author_name       TEXT    NOT NULL DEFAULT '',
     author_avatar_url TEXT    NOT NULL DEFAULT '',
     PRIMARY KEY (group_id, author_id)
+);
+CREATE TABLE IF NOT EXISTS {_CARD_TABLE} (
+    message_id INTEGER PRIMARY KEY,
+    kind       TEXT    NOT NULL,
+    target_id  INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
 );
 """
 
@@ -158,3 +171,39 @@ def update_author_info(author_id: int, *, name: str = "", avatar_url: str = "") 
                 f"UPDATE {_TABLE} SET author_avatar_url = ? WHERE author_id = ?",
                 (avatar_url, author_id),
             )
+
+
+# ── 卡片消息映射：「获取全文」+ 引用卡片时定位作品 ──────────────────
+#
+# 为什么要落库而不是只记内存：用户很可能在机器人**重启之后**引用之前那条卡片，
+# 内存映射一重启就没了，落库才能跨重启命中。
+# 键是**消息自己的 id**，值是这个 id 指向的作品 —— 用户引用哪条就查哪条。
+
+
+def remember_card(message_id: int, kind: str, target_id: int) -> None:
+    """记下「这条卡片消息讲的是哪个作品」。`kind` ∈ {'novel','series'}。
+
+    顺手清掉过期行（见 `_CARD_TTL_SECONDS`）。清理放在写入路径上，
+    避免为了它单开一个定时任务 —— 这张表的写入频率极低（每次发卡片一次）。
+    """
+    now = int(time.time())
+    with _conn() as conn:
+        conn.execute(
+            f"DELETE FROM {_CARD_TABLE} WHERE created_at < ?", (now - _CARD_TTL_SECONDS,)
+        )
+        # INSERT OR REPLACE：同一个 message_id 不会变指，但这让重复写入幂等，
+        # 而不是抛 IntegrityError 把发卡片的主流程带崩。
+        conn.execute(
+            f"INSERT OR REPLACE INTO {_CARD_TABLE}"
+            " (message_id, kind, target_id, created_at) VALUES (?, ?, ?, ?)",
+            (message_id, kind, target_id, now),
+        )
+
+
+def lookup_card(message_id: int) -> sqlite3.Row | None:
+    """查这条消息是不是机器人发的作品卡片；不是则返回 None。"""
+    with _conn() as conn:
+        return conn.execute(
+            f"SELECT kind, target_id, created_at FROM {_CARD_TABLE} WHERE message_id = ?",
+            (message_id,),
+        ).fetchone()

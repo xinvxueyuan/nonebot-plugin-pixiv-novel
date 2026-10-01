@@ -60,6 +60,30 @@ def is_admin(
     return is_admin_identity(user_id, admin_ids=admin_ids, superusers=superusers)
 
 
+def is_group_allowed(group_id: object, *, whitelist: Iterable[object]) -> bool:
+    """群白名单闸门：这个群能不能用插件。
+
+    判断顺序（**测试依赖这个顺序，不要改**）：
+        ① 白名单为空 → 放行（功能关闭）
+        ② 群号为 None（私聊）→ 放行（白名单管的是「群」）
+        ③ 群号在名单里 → 放行
+
+    **空列表 = 关闭白名单，不是「谁都不许用」** —— 这是刻意的默认：
+    新装插件时不用先配群号就能用，配上群号才收紧。
+    （对照 `pixiv_text_targets` 的空列表是「都不受理」，两者语义相反，
+     因为那边是「允许名单」而这边是「限制名单」，别照搬。）
+
+    ⚠️ 两边都转 `str` 再比：NoneBot 的 `group_id` 是 int，而配置里可能
+    写成字符串（用户手改 .env 时很常见），直接 `in` 比对会静默不匹配。
+    """
+    allowed = {str(x).strip() for x in whitelist}
+    if not allowed:
+        return True
+    if group_id is None:
+        return True
+    return str(group_id).strip() in allowed
+
+
 def decide_text_delivery(
     *,
     channel: str,

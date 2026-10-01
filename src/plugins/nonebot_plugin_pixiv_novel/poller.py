@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable
 
 from nonebot.adapters.onebot.v11 import Message
 
-from . import store
+from . import policy, store
 from .config import Config
 from .message import build_push
 from .pixiv_client import PixivClient, original_cover_url
@@ -64,6 +64,21 @@ async def poll_once(
         for sub in store.list_by_author(author_id):
             group_id = sub["group_id"]
             last_seen = sub["last_seen"]
+
+            # ── 群白名单 ────────────────────────────────────────────────
+            # 不在白名单的群**完全不服务**：不推送，并把高水位一次推进到最新，
+            # 不留下任何积压。
+            #
+            # 为什么是「推进」而不是「什么都不做」：若直接 continue，
+            # 用户把这个群重新加回白名单时，会把离线期间积压的旧作一次性推出来 ——
+            # 与本插件「订阅前的历史作品不推送」的取向相反（也是刷屏）。
+            # 这里一次性写到位而不是逐篇写，既省 DB 往返，也避免在
+            # `landed` 永远为空的情况下把整份 fresh 列表逐条走一遍。
+            if not policy.is_group_allowed(
+                group_id, whitelist=config.pixiv_group_whitelist
+            ):
+                store.set_last_seen(group_id, author_id, newest_id)
+                continue
 
             # 首次：只播种高水位，不推送历史作品
             if last_seen == 0:

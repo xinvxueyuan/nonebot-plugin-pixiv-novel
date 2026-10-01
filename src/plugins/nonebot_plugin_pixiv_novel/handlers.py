@@ -40,6 +40,49 @@ def safe_filename(novel_id: int, title: str, limit: int = 20) -> str:
     return f"{novel_id}_{cleaned or 'untitled'}.txt"
 
 
+def reply_message_id(event: Any) -> int | None:
+    """取本条消息**引用**的那条消息的 id；没引用或取不到返回 None。
+
+    为什么要防御式地读：`event.reply` 的填充方式**按 OneBot 实现而异** ——
+    它可能是适配器 pydantic 模型里的 `Reply`（字段 `message_id`），
+    也可能被实现塞成一个 `type="reply"` 的 `MessageSegment`（数据在 `data["id"]`）。
+    写死其中一种，换个实现就静默返回 None（症状是「引用了卡片但命令说没引用」）。
+
+    ⚠️ `id` 可能是 `"0"` 或空串（实现找不到原消息时的占位），这类值一律当没引用 ——
+    否则会拿 0 去查表，永远查不到，用户看到的是「引用无效」而不是「这张卡片我不认识」。
+    """
+    reply = getattr(event, "reply", None)
+
+    raw: Any = None
+    if reply is not None:
+        data = getattr(reply, "data", None)
+        if isinstance(data, dict):
+            raw = data.get("id")
+        if raw is None:
+            raw = getattr(reply, "message_id", None)
+
+    # 退回扫消息段：适配器没填 event.reply 时，reply 段可能只存在于消息体里。
+    if raw is None:
+        getter = getattr(event, "get_message", None)
+        if callable(getter):
+            try:
+                message: Any = getter()
+                for seg in message:
+                    if getattr(seg, "type", None) == "reply":
+                        raw = (getattr(seg, "data", None) or {}).get("id")
+                        break
+            except Exception:
+                logger.warning("扫描引用消息段失败", exc_info=True)
+
+    if raw is None:
+        return None
+    try:
+        mid = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return mid or None
+
+
 async def deliver_novel_text(
     *,
     text: str,
