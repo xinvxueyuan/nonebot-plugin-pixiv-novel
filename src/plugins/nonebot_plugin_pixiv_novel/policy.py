@@ -1,0 +1,68 @@
+"""权限闸门与投递策略。
+
+**两根正交的轴**（计划 §2.1），不要合并成一个配置：
+  - 轴 1 `pixiv_text_targets`         → 群聊/私聊能不能用「获取全文」
+  - 轴 2 `pixiv_r18_text_allow_group` → R18 全文能不能进群（只管群，不管私聊）
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+
+_R18_LABEL = {1: "R-18", 2: "R-18G"}
+
+
+def _as_id_set(ids: Iterable[object]) -> set[str]:
+    """统一成字符串集合：NoneBot 的 user_id 是 str，配置里可能写 int。"""
+    return {str(i) for i in ids}
+
+
+def is_admin(
+    user_id: object,
+    *,
+    admin_only: bool,
+    admin_ids: Iterable[object],
+    superusers: Iterable[object],
+) -> bool:
+    """管理员判定。
+
+    admin_only=False            → 所有人放行（闸门关掉）
+    admin_ids 非空              → 只认这个名单
+    admin_ids 为空 且 admin_only → 回退 NoneBot 全局 SUPERUSERS
+    """
+    if not admin_only:
+        return True
+    uid = str(user_id)
+    explicit = _as_id_set(admin_ids)
+    if explicit:
+        return uid in explicit
+    return uid in _as_id_set(superusers)
+
+
+def decide_text_delivery(
+    *,
+    channel: str,
+    x_restrict: int,
+    pixiv_text_targets: Iterable[str],
+    pixiv_r18_text_allow_group: bool,
+) -> tuple[bool, str]:
+    """「获取全文」能否在此渠道投递。返回 `(是否允许, 拒绝原因)`。
+
+    判断顺序（**测试依赖这个顺序，不要改**）：
+        ① 渠道在 targets 内 → ② 非「R18 且群聊且开关未开」→ ③ 放行
+    """
+    targets = {str(t).strip().lower() for t in pixiv_text_targets}
+
+    # ① 渠道轴
+    if channel not in targets:
+        where = "群聊" if channel == "group" else "私聊"
+        return False, f"当前配置不允许在{where}使用「获取全文」"
+
+    # ② 内容轴：只约束群聊；私聊不被 R18 开关限制
+    if x_restrict > 0 and channel == "group" and not pixiv_r18_text_allow_group:
+        label = _R18_LABEL.get(x_restrict, "R-18")
+        hint = "如需阅读请私聊机器人" if "private" in targets else ""
+        return False, (f"{label} 作品全文默认不发群聊。{hint}").strip()
+
+    # ③ 放行
+    return True, ""

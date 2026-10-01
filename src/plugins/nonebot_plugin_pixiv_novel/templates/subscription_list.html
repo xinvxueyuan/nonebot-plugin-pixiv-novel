@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  /* CJK 字体必须在 CSS 里显式指定：template_to_pic 没有 font_name 参数（§1.9） */
+  body { font-family: "Noto Sans CJK SC", "WenQuanYi Zen Hei", "Noto Sans", sans-serif;
+         margin: 0; padding: 16px; background: #f6f7f9; }
+  .card { background: #ffffff; border-radius: 10px; padding: 16px 18px;
+          box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08); }
+  .title { font-size: 18px; font-weight: bold; color: #1f2937; margin: 0 0 4px 0; }
+  .sub { font-size: 12px; color: #6b7280; margin: 0 0 12px 0; }
+  .row { display: flex; align-items: center; gap: 10px;
+         padding: 8px 0; border-bottom: 1px solid #f0f0f0;
+         font-size: 13px; color: #111827; }
+  .idx { color: #9ca3af; min-width: 18px; }
+  /* 头像：固定 40x40 圆形裁切 */
+  .avatar { width: 40px; height: 40px; border-radius: 50%;
+            object-fit: cover; flex: 0 0 40px; }
+  /* 无头像时的首字占位块 */
+  .avatar.ph { display: inline-block; line-height: 40px; text-align: center;
+               background: #e5e7eb; color: #6b7280;
+               font-size: 16px; font-weight: bold; }
+  .meta { display: flex; flex-direction: column; }
+  .name { font-size: 14px; font-weight: bold; color: #111827; }
+  .line2 { font-size: 11px; color: #6b7280; }
+  .url { font-size: 11px; color: #2563eb; }
+  .empty { font-size: 13px; color: #6b7280; }
+  .foot { margin-top: 10px; font-size: 11px; color: #9ca3af; text-align: right; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <p class="title">本群订阅的作者</p>
+    <p class="sub">共 {{ count }} 位</p>
+    {% if items %}
+      {% for it in items %}
+      <div class="row">
+        <span class="idx">{{ it.index }}.</span>
+        {% if it.avatar_uri %}
+        <img class="avatar" src="{{ it.avatar_uri }}" alt="">
+        {% else %}
+        <span class="avatar ph">{{ it.author_name[0] }}</span>
+        {% endif %}
+        <span class="meta">
+          <span class="name">{{ it.author_name }}</span>
+          <span class="line2">ID {{ it.author_id }} · 订阅于 {{ it.subscribed_at }}</span>
+          <span class="url">{{ it.author_url }}</span>
+        </span>
+      </div>
+      {% endfor %}
+      {% if truncated %}
+      <p class="empty">另有 {{ truncated }} 位未显示</p>
+      {% endif %}
+    {% else %}
+      <p class="empty">本群还没有订阅任何作者</p>
+    {% endif %}
+    <p class="foot">群号 {{ group_id }}</p>
+  </div>
+</body>
+</html>
