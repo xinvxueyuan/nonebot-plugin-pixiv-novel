@@ -43,9 +43,28 @@ def _cache_file(url: str) -> Path:
     return _ensure_cache_dir() / f"{hashlib.sha256(url.encode()).hexdigest()}.bin"
 
 
+def _sniff_mime(data: bytes) -> str:
+    """按**magic bytes**判断图片类型。
+
+    ⚠️ 不能像初稿那样硬编码 `image/jpeg` —— pixiv 头像确实有 PNG
+    （实测：URL 结尾 `.png`、内容开头 `\\x89PNG\\r\\n\\x1a\\n`，却被标成 jpeg）。
+    MIME 与实际内容不符时，浏览器/渲染器可能拒绝显示，头像就白了。
+    """
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"          # 兜底：htmlkit 那边仍会按内容解码
+
+
 def _to_data_uri(data: bytes) -> str:
-    """包成 data URI。htmlkit 的 native_data_scheme 会原生解码。"""
-    return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
+    """包成 data URI（MIME 按真实内容嗅探）。htmlkit 的 native_data_scheme 会原生解码。"""
+    mime = _sniff_mime(data)
+    return f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
 
 
 async def data_uri(url: str, *, fetch: Fetcher) -> str | None:

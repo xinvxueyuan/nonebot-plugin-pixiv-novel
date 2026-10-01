@@ -130,3 +130,46 @@ async def test_gather_for_rows_is_resilient_to_partial_failure():
     mapping = await avatars.for_rows(rows, fetch=Flaky())
     assert "https://i.pximg.net/bad.jpg" not in mapping   # 失败的没进来
     assert "https://i.pximg.net/ok.jpg" in mapping
+
+
+# ── data URI 的 MIME 必须按真实内容嗅探 ──────────────────────
+# 实测：pixiv 头像确实有 PNG（URL 结尾 .png、内容 \x89PNG...），
+# 而初稿把 MIME 硬编码成 image/jpeg → 前缀与内容不符。
+
+
+def test_data_uri_uses_png_mime_for_png_content():
+    """真实场景：URL 是 .png、内容是 PNG → 前缀必须是 image/png。"""
+    png = _png()
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+    assert avatars._to_data_uri(png).startswith("data:image/png;base64,")
+
+
+def test_data_uri_uses_jpeg_mime_for_jpeg_content():
+    buf = io.BytesIO()
+    Image.new("RGB", (32, 32), (200, 30, 30)).save(buf, format="JPEG")
+    jpg = buf.getvalue()
+    assert jpg.startswith(b"\xff\xd8\xff")
+    assert avatars._to_data_uri(jpg).startswith("data:image/jpeg;base64,")
+
+
+def test_data_uri_uses_gif_and_webp_mime():
+    buf = io.BytesIO()
+    Image.new("RGB", (16, 16)).save(buf, format="GIF")
+    assert avatars._to_data_uri(buf.getvalue()).startswith("data:image/gif;base64,")
+
+    buf = io.BytesIO()
+    Image.new("RGB", (16, 16)).save(buf, format="WEBP")
+    assert avatars._to_data_uri(buf.getvalue()).startswith("data:image/webp;base64,")
+
+
+def test_data_uri_payload_is_intact_regardless_of_mime():
+    """嗅探只影响前缀，base64 内容必须原样可解回原字节。"""
+    png = _png()
+    uri = avatars._to_data_uri(png)
+    b64 = uri.split(",", 1)[1]
+    assert base64.b64decode(b64) == png
+
+
+def test_data_uri_unknown_format_falls_back_to_jpeg_label():
+    """认不出的格式给个兜底 MIME，不能抛异常（渲染器仍按内容解码）。"""
+    assert avatars._to_data_uri(b"\x00\x01unknownbytes").startswith("data:image/jpeg;base64,")

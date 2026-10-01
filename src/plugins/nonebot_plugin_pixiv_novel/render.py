@@ -34,6 +34,28 @@ def _fmt_time(ts: Any) -> str:
         return ""
 
 
+def _row_get(row: Any, key: str, default: Any = None) -> Any:
+    """从订阅行里取值，**同时兼容 `sqlite3.Row` 和 dict**。
+
+    ⚠️⚠️ `sqlite3.Row` **没有 `.get()`**（只有 `row["key"]`，缺键会抛 IndexError）。
+    而 `store` 设了 `conn.row_factory = sqlite3.Row`，所以生产环境的行**全是 Row**。
+
+    直接写 `r.get("author_name")` 会抛
+    `AttributeError: 'sqlite3.Row' object has no attribute 'get'`；
+    而 `render_subscription_list()` 把**所有**异常都吞成「回退纯文本」，
+    于是「订阅列表」的图片渲染**整个是死的、还不报错** —— 用户只看到永远是纯文本。
+
+    这个 bug 单测没抓到，因为测试里的行是手写的 **dict**（有 `.get`）。
+    现在 `tests/test_render.py` 改成从真 store 取行，形状与生产一致。
+    """
+    if hasattr(row, "get"):                     # dict / Mapping
+        return row.get(key, default)
+    try:                                         # sqlite3.Row
+        return row[key]
+    except (IndexError, KeyError, TypeError):
+        return default
+
+
 def build_context(
     rows: Sequence[Any],
     *,
@@ -50,8 +72,8 @@ def build_context(
     items = []
     for i, r in enumerate(rows[:max_items]):
         author_id = int(r["author_id"])
-        name = str(r.get("author_name") or "").strip()
-        avatar_url = str(r.get("author_avatar_url") or "")
+        name = str(_row_get(r, "author_name") or "").strip()
+        avatar_url = str(_row_get(r, "author_avatar_url") or "")
         items.append(
             {
                 "index": i + 1,
@@ -59,7 +81,7 @@ def build_context(
                 "author_name": name or str(author_id),     # 没名字就显示 ID，不留白
                 "author_url": user_url(author_id),
                 "avatar_uri": avatars.get(avatar_url) or None,
-                "subscribed_at": _fmt_time(r.get("created_at")),
+                "subscribed_at": _fmt_time(_row_get(r, "created_at")),
                 "last_seen": int(r["last_seen"]),
             }
         )
