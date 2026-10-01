@@ -19,8 +19,9 @@
 from __future__ import annotations
 
 import logging
+import time
 
-from nonebot import get_bot, get_driver, get_plugin_config, on_command, require
+from nonebot import get_bot, get_driver, get_plugin_config, on_command, on_message, require
 from nonebot.adapters.onebot.v11 import (
     GroupMessageEvent,
     Message,
@@ -72,7 +73,7 @@ except Exception as e:
 
 from nonebot_plugin_apscheduler import scheduler
 
-from . import avatars, handlers, policy, render, store
+from . import avatars, handlers, message, policy, render, store, urls
 from .config import Config
 from .message import novel_url
 from .pixiv_client import PixivClient
@@ -185,7 +186,9 @@ async def _startup() -> None:
         f"全文本可投递渠道={plugin_config.pixiv_text_targets} "
         f"R18全文允许发群={plugin_config.pixiv_r18_text_allow_group} "
         f"R18推送={plugin_config.pixiv_r18_push_enabled} "
-        f"R18封面模糊={plugin_config.pixiv_blur_r18}(radius={plugin_config.pixiv_blur_radius})"
+        f"R18封面模糊={plugin_config.pixiv_blur_r18}(radius={plugin_config.pixiv_blur_radius}) "
+        f"URL被动卡片={plugin_config.pixiv_url_hook_enabled}"
+        f"(去重={plugin_config.pixiv_url_hook_cooldown}s)"
     )
     if not plugin_config.pixiv_text_targets:
         logger.warning("PIXIV_TEXT_TARGETS 为空列表：「获取全文」将对任何人都拒绝")
@@ -299,7 +302,117 @@ async def _(event: GroupMessageEvent):
     await list_cmd.finish(MessageSegment.image(img))
 
 
-# ── 获取全文（群聊 + 私聊；由 PIXIV_TEXT_TARGETS 与 R18 开关共同决定）──
+# ── 被动 URL hook：消息里出现 pixiv 小说链接就回卡片 ──────────────
+#
+# 几个刻意的选择（都不是随手写的）：
+#
+# · `priority=20` + 命令是 `priority=10, block=True` → 命令先匹配并**阻断**传播，
+#   所以 `获取全文 <链接>` 只会走命令那一条路，**不会**再被这里回一次卡片。
+#   不靠「文本里排除命令关键字」这种脆弱判断（COMMAND_START=[""] 时尤其容易漏）。
+# · `block=False`：本 hook 是**旁观者**，绝不吞掉别人的消息 —— 别的插件
+#   （如合并转发、词库）该收到还得收到。
+# · 机器人自己的消息直接跳过，否则卡片里的 pixiv 链接会让它**自我触发**（无限循环）。
+# · 不去查数据库、不看订阅关系：这个功能是「谁贴链接就答谁」，与订阅无关。
+url_hook = on_message(priority=20, block=False)
+
+# 去重窗口：键 = (会话, 种类, 目标ID) → 上次回复的 monotonic 时间
+_seen: dict[tuple[str, str, int], float] = {}
+
+
+def _session_key(event: MessageEvent) -> str:
+    """会话标识：**按会话隔离**去重（群与群之间、群与私聊之间互不影响）。"""
+    if isinstance(event, GroupMessageEvent):
+        return f"group:{event.group_id}"
+    return f"private:{event.user_id}"
+
+
+def _should_skip(key: tuple[str, str, int]) -> bool:
+    """同一会话里刚回过的同一个作品就跳过。返回 True 表示应跳过。"""
+    window = plugin_config.pixiv_url_hook_cooldown
+    if window <= 0:
+        return False
+    now = time.monotonic()
+    # 顺手清理过期项，避免长期运行下字典无限增长
+    for k in [k for k, t in _seen.items() if now - t >= window]:
+        _seen.pop(k, None)
+    last = _seen.get(key)
+    if last is not None and now - last < window:
+        return True
+    _seen[key] = now
+    return False
+
+
+@url_hook.handle()
+async def _(event: MessageEvent):
+    if not plugin_config.pixiv_url_hook_enabled:
+        return
+
+    # 机器人自己的消息（含它刚发出的卡片）—— 不跳过就会自我触发
+    if str(event.user_id) == str(event.self_id):
+        return
+
+    hit = urls.parse(urls.candidates(event.get_message()))
+    if hit is None:
+        return
+
+    kind, target_id = hit
+    key = (_session_key(event), kind, target_id)
+    if _should_skip(key):
+        logger.info(f"URL hook：{key} 在去重窗口内，跳过")
+        return
+
+    logger.info(f"URL hook 命中：{kind}={target_id} 会话={key[0]}")
+
+    try:
+        if kind == "novel":
+            msg = await _build_novel_card(target_id)
+        else:
+            msg = await _build_series_card(target_id)
+    except Exception as e:
+        logger.warning(f"URL hook 取 {kind}={target_id} 失败: {type(e).__name__}: {e}")
+        await url_hook.finish(f"取 {kind} {target_id} 失败，确认链接是否有效")
+        return
+
+    await url_hook.finish(msg)
+
+
+async def _fetch_cover(url: str, x_restrict: int) -> tuple[bytes, bool]:
+    """下载封面并按 R18 规则决定是否模糊。返回 `(字节, 是否已模糊)`。
+
+    封面拿不到**不算失败**：返回空字节，卡片照样发（只是没图）。
+    """
+    if not url:
+        return b"", False
+    blurred = plugin_config.pixiv_blur_r18 and x_restrict in (1, 2)
+    try:
+        data = await client.download_cover(
+            url, blur=blurred, radius=plugin_config.pixiv_blur_radius
+        )
+        return data, blurred
+    except Exception as e:
+        logger.warning(f"URL hook 下载封面失败（卡片改为无图）: {type(e).__name__}: {e}")
+        return b"", False
+
+
+async def _build_novel_card(novel_id: int) -> Message:
+    detail = await client.novel_detail(novel_id)
+    x_restrict = int(getattr(detail, "x_restrict", 0) or 0)
+    cover_url = (getattr(getattr(detail, "image_urls", None), "large", "") or "")
+    cover, blurred = await _fetch_cover(cover_url, x_restrict)
+    return message.build_push(detail, cover, blurred=blurred)
+
+
+async def _build_series_card(series_id: int) -> Message:
+    from . import pixiv_client
+
+    body = await client.novel_series(series_id)
+    # R18 用**系列自己**的 xRestrict（网页接口专有；App 接口没有这个字段）
+    x_restrict = int(body.get("xRestrict") or 0)
+    cover, blurred = await _fetch_cover(pixiv_client.series_cover_url(body), x_restrict)
+    return message.build_series_push(body, cover, blurred=blurred)
+
+
+
 text_cmd = on_command("获取全文", priority=10, block=True)
 
 

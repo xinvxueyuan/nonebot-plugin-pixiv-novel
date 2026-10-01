@@ -82,6 +82,16 @@ class Config(BaseModel):
         description="R18 作品的全文是否允许发到群聊；**私聊不受此开关限制**",
     )
 
+    # ---- 被动 URL hook：消息里出现 pixiv 小说链接就回卡片 ----
+    pixiv_url_hook_enabled: bool = Field(
+        default=True,
+        description="群里/私聊里出现 pixiv 小说链接时，自动回一张作品/系列信息卡片",
+    )
+    pixiv_url_hook_cooldown: int = Field(
+        default=60, ge=0, le=3600,
+        description="同一作品在同一会话里的去重窗口（秒）；防刷屏，也省 pixiv 配额。0=不去重",
+    )
+
     # ---- 全文长度 ----
     pixiv_text_max_chars: int = Field(
         default=4000, ge=100,

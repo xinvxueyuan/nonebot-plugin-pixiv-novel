@@ -86,6 +86,58 @@ def _check_novel_shape(novel: Any) -> None:
         )
 
 
+# ── 小说系列：走**网页版** AJAX 接口（不是 App 接口）──────────────────
+#
+# ⚠️ 为什么必须是网页接口（2026-10-02 实测两套接口对比，脚本 scripts/probe_series_r18.py
+#    与 scripts/probe_series_web_body.py）：
+#
+#   App `/v2/novel/series`     → 顶层 {novel_series_detail, novel_series_first_novel, …}
+#                                `novel_series_detail` **只有 11 个键，没有任何 R18 字段**
+#                                （拿一个 4 篇全 R18 的系列验过，排除「false 被省略」的假象）
+#   Web `/ajax/novel/series/N` → `body.xRestrict` **就是系列级 R18**（R18 系列=1，非 R18=0，
+#                                非 R18 时是**显式的 0 而不是缺键**）
+#
+# 走 App 接口就只能「回头去查首篇的 x_restrict」来猜系列 R18 —— 那既多一次请求，
+# 又对「首篇非 R18 但系列含 R18」的混合系列判错。网页接口一次调用直接给全部字段：
+# xRestrict / title / caption / userName / userId / profileImageUrl /
+# publishedContentCount / publishedTotalCharacterCount / isConcluded / tags / cover.urls。
+SERIES_WEB_API = "https://www.pixiv.net/ajax/novel/series/{series_id}"
+
+# 系列封面的候选键，按「适合群里显示」的大小优先（太大拖慢经代理的下载）
+_SERIES_COVER_KEYS = ("480mw", "1200x1200", "240mw", "original", "128x128")
+
+
+def series_cover_url(body: Any) -> str:
+    """从网页接口的 `body.cover.urls` 里挑一个封面 URL；没有则空串。"""
+    cover = (body.get("cover") or {}) if hasattr(body, "get") else {}
+    urls = cover.get("urls") or {}
+    if not isinstance(urls, dict):
+        return ""
+    for k in _SERIES_COVER_KEYS:
+        v = urls.get(k)
+        if v:
+            return str(v)
+    return ""
+
+
+def _check_series_shape(body: Any) -> None:
+    """系列响应体检：缺 `xRestrict` 要**大声告警**。
+
+    缺了它 R18 系列会被当普通系列（封面不模糊）而且**不报错** ——
+    这正是本项目反复踩的那类静默降级。
+    """
+    if not hasattr(body, "get"):
+        logger.warning(f"novel_series 响应不是 dict（{type(body).__name__}），系列卡片会降级")
+        return
+    missing = [k for k in ("id", "title", "xRestrict") if body.get(k) is None]
+    if missing:
+        logger.warning(
+            f"小说系列响应缺少字段 {missing} —— pixiv 网页接口结构可能变了。"
+            f"现有键={sorted(body.keys())[:24]}. "
+            f"缺 xRestrict 会让 R18 系列的封面**不被模糊**。"
+        )
+
+
 def _retry_sync(fn: Callable[[], Any], tries: int = 3, delay: float = 2.0) -> Any:
     """同步重试 —— pixiv 经代理偶发 SSL EOF / 连接重置（实测 10 分钟内遇到两次）。
 
@@ -186,6 +238,37 @@ class PixivClient:
             resp = await client.get(url)
             resp.raise_for_status()
             return resp.content
+
+    async def novel_series(self, series_id: int) -> Any:
+        """小说系列 → 网页接口的 `body`（**含系列级 `xRestrict`**）。
+
+        ⚠️ 走的是网页版 `/ajax/novel/series/N` 而不是 App 的 `/v2/novel/series`：
+        App 接口的系列详情里**根本没有 R18 字段**（实测，见模块顶部注释），
+        而网页接口的 `body.xRestrict` 就是系列级 R18。
+
+        用 httpx 而不是 pixivpy3：这个接口是给网页前端用的 JSON，不在 pixivpy3
+        的封装里。它**不需要登录 cookie**（实测无 cookie 也能拿到 R18 系列的数据）。
+        """
+        headers = {"Referer": COVER_REFERER, "User-Agent": _UA, "Accept": "application/json"}
+        kwargs: dict[str, Any] = {}
+        if self.proxy:
+            kwargs["proxy"] = self.proxy
+        url = SERIES_WEB_API.format(series_id=series_id)
+        async with httpx.AsyncClient(
+            timeout=30.0, follow_redirects=True, headers=headers, **kwargs
+        ) as http:
+            resp = await http.get(url)
+            resp.raise_for_status()
+            payload = resp.json()
+        # 网页接口统一是 {"error": bool, "message": str, "body": {...}}
+        if isinstance(payload, dict) and payload.get("error"):
+            raise ValueError(f"pixiv 网页接口返回错误：{payload.get('message')}")
+        body = payload.get("body") if isinstance(payload, dict) else None
+        if not isinstance(body, dict):
+            keys = sorted(payload)[:9] if isinstance(payload, dict) else type(payload).__name__
+            raise ValueError(f"novel_series 响应缺少 body（顶层键={keys}）")
+        _check_series_shape(body)
+        return body
 
     async def download_cover(self, url: str, *, blur: bool, radius: int) -> bytes:
         """下载封面，可选高斯模糊（`blur=True` 时用 `radius` 像素作半径）。"""
