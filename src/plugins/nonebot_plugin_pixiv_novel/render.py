@@ -109,9 +109,18 @@ async def render_subscription_list(
     *,
     group_id: int,
     avatars: Mapping[str, str] | None = None,
-    max_width: int = 700,
+    max_width: int = 860,
 ) -> bytes | None:
-    """把订阅列表渲染成 PNG。**任何失败都返回 None**（调用方负责回退纯文本）。"""
+    """把订阅列表渲染成 PNG。**任何失败都返回 None**（调用方负责回退纯文本）。
+
+    `max_width` 是**上限（cap）**，不是缩放器。`allow_refit=True` 时内容会被
+    挤压去适配它 —— 所以 CSS 里 `.card` 的宽度 + 两侧 padding 必须**小于**这个值，
+    否则会被压扁、文字溢出卡片（实测踩过：卡片 700px + body padding 40 时
+    总宽 740 > 上限 700，压完之后内容冲出卡片右缘 38px）。
+
+    当前模板：`.card` 760px + body padding 20*2 = 总宽 800，所以这里给 860 留余量。
+    改模板宽度时记得同步核对这个值。
+    """
     if not rows:
         return None
     try:

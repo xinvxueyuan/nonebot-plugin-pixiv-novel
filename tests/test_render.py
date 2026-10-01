@@ -233,3 +233,100 @@ def test_row_get_handles_both_row_and_dict():
 
     assert render._row_get({"a": 1}, "a") == 1
     assert render._row_get({"a": 1}, "missing", "d") == "d"
+
+
+# ══════════════════════════════════════════════════════════════════
+# 模板回归：两件**实测**出来的事，用静态断言锁住
+#
+# 起因（用户反馈）：
+#   ① 「订阅列表的宽高和px太小了，图渲染出来在QQ属于小图」
+#   ② 「订阅列表的头像与右侧的各类元素的距离太近，粘在一起了」
+# 实测根因：
+#   · htmlkit 用原生渲染器 core.pyd（不是真 Chromium）**不支持 flex 的 `gap`** ——
+#     `gap:10px` 时头像紧贴序号块（头像起点 52 = 序号块右缘）；
+#     改用 margin 后头像起点右移 12px，间距才真的出现
+#   · `dpi` 与 `max_width` 对输出像素**完全无效**（96/144/192、700/900 同尺寸），
+#     图片宽度由内容固有宽度决定 → 想变大只能把 CSS 尺寸写大
+#     （旧版 335x222 → 放大后约 700x376）
+# ══════════════════════════════════════════════════════════════════
+
+
+def _template_css() -> str:
+    return (render.TEMPLATES_DIR / render.TEMPLATE_NAME).read_text(encoding="utf-8")
+
+
+def _css_rules() -> dict[str, str]:
+    """把模板 `<style>` 里的规则解析成 `{选择器: 声明块}`。
+
+    两个都踩过的坑：
+      · **必须去掉 `/* 注释 */`** —— 注释里写了「实测 `gap: 10px` 时…」，
+        不去注释就会把解释性文字误判成「真的用了 gap」，测试假红
+      · **规则可能跨多行**（如 `.avatar` 的 margin-right 在第二行），
+        所以按 `}` 收块取声明，不能只看选择器所在那一行
+    """
+    css = _template_css()
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)          # 去注释
+    body = css.split("<style>", 1)[1].split("</style>", 1)[0]
+    rules: dict[str, str] = {}
+    for block in body.split("}"):
+        if "{" not in block:
+            continue
+        sel, _, decls = block.partition("{")
+        rules[sel.strip()] = decls.strip()
+    return rules
+
+
+def _px(decls: str, prop: str) -> float:
+    """从声明块里取某个属性的 px 值。
+
+    ⚠️ 冒号在属性名**后面**（`font-size: 26px`），早先用 `rstrip(":")` 从右边剥，
+    剥不掉，于是 `float(": 26")` 抛 ValueError、被 `continue` 吞掉，
+    报出「没找到 … 的 font-size」这种误导性失败。用正则直接匹配最省事。
+    """
+    m = re.search(rf"(?:^|;)\s*{re.escape(prop)}\s*:\s*([0-9.]+)px", decls)
+    assert m, f"声明块里没有 {prop}: {decls!r}"
+    return float(m.group(1))
+
+
+def test_template_does_not_rely_on_flex_gap():
+    """**核心回归**：flex 容器里不许用 `gap:` 做间距。
+
+    本渲染器不支持 `gap`，写了等于没写 —— 元素直接贴在一起。
+    必须用 margin/padding。这条挂了就说明有人又用回了 `gap`。
+    """
+    rules = _css_rules()
+    offenders = {
+        sel: decls for sel, decls in rules.items()
+        if re.search(r"(?:^|;)\s*gap\s*:", decls)
+    }
+    assert not offenders, (
+        f"这些规则用了 `gap`，但本渲染器不支持（元素会粘住）：{offenders}"
+    )
+
+
+def test_row_and_meta_use_margins_for_spacing():
+    """间距必须来自 margin —— 这是本渲染器唯一生效的手段。"""
+    rules = _css_rules()
+    assert "margin-right" in rules[".avatar"]
+    assert "margin-right" in rules[".idx"]
+    assert "margin-bottom" in rules[".name"]
+
+
+def test_avatar_has_spacing_on_the_text_side():
+    """头像到文字那一侧必须有 margin（用户反馈「粘在一起」就是这里）。"""
+    rules = _css_rules()
+    avatar = rules[".avatar"]
+    assert re.search(r"margin-right\s*:\s*[0-9.]+px", avatar), f".avatar: {avatar!r}"
+    assert _px(avatar, "margin-right") >= 12, "头像与文字的间距太小（会显得粘住）"
+
+
+def test_render_sizes_are_large_enough_for_qq():
+    """字号与头像不能太小 —— 否则渲染出来在 QQ 里就是一张小图。"""
+    rules = _css_rules()
+
+    assert _px(rules[".name"], "font-size") >= 20, "作者名字号太小"
+    assert _px(rules[".line2"], "font-size") >= 16, "副信息（ID/时间）字号太小"
+    assert _px(rules[".url"], "font-size") >= 16, "链接字号太小"
+    assert _px(rules[".avatar"], "width") >= 64, "头像太小"
+    assert _px(rules[".card"], "width") >= 600, "卡片太窄（整图会偏小）"
+    assert _px(rules[".title"], "font-size") >= 26, "标题字号太小"

@@ -111,6 +111,62 @@ def test_empty_targets_blocks_everything():
         assert ok is False
 
 
+# ── 管理员绕过「获取全文」的限制（2026-10-02 用户要求）──────────
+
+
+def test_admin_bypasses_channel_axis():
+    """管理员不受渠道轴限制（默认只允许群聊，但管理员在私聊也能取）。"""
+    ok, reason = decide_text_delivery(
+        channel="private", x_restrict=0, is_admin=True, **_cfg()
+    )
+    assert ok is True
+    assert reason == ""
+
+
+def test_admin_bypasses_r18_axis_in_group():
+    """管理员在群里也能取 R18 正文（默认是不允许的）。"""
+    ok, reason = decide_text_delivery(
+        channel="group", x_restrict=1, is_admin=True, **_cfg()
+    )
+    assert ok is True
+    assert reason == ""
+
+
+def test_admin_bypasses_both_axes_even_when_targets_empty():
+    """targets 全空（对普通人等于全拒）也拦不住管理员。"""
+    ok, _ = decide_text_delivery(
+        channel="group",
+        x_restrict=2,
+        is_admin=True,
+        **_cfg(pixiv_text_targets=[], pixiv_r18_text_allow_group=False),
+    )
+    assert ok is True
+
+
+def test_non_admin_still_subject_to_all_axes():
+    """非管理员一切照旧 —— 绕过只给管理员，不能顺手放宽。"""
+    assert decide_text_delivery(channel="private", x_restrict=0, is_admin=False, **_cfg())[0] is False
+    assert decide_text_delivery(channel="group", x_restrict=1, is_admin=False, **_cfg())[0] is False
+
+
+def test_is_admin_defaults_to_false_keeps_backward_compat():
+    """不传 is_admin 时行为与改前完全一致（默认 False）。"""
+    ok, reason = decide_text_delivery(channel="group", x_restrict=1, **_cfg())
+    assert ok is False
+    assert "R-18" in reason
+
+
+def test_admin_flag_does_not_leak_into_normal_path():
+    """is_admin=True 走的是独立分支，不会改变 `targets` 的解析方式。"""
+    ok, _ = decide_text_delivery(
+        channel="GROUP",  # 大小写/空白应被归一化
+        x_restrict=0,
+        is_admin=False,
+        **_cfg(pixiv_text_targets=["  Group  "]),
+    )
+    assert ok is True
+
+
 def test_r18_rejection_suggests_private_only_when_private_is_available():
     _, reason = decide_text_delivery(channel="group", x_restrict=1, **_cfg())
     assert "私聊" not in reason          # 默认 targets 不含 private，不该误导用户

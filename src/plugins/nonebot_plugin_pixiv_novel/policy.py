@@ -45,12 +45,30 @@ def decide_text_delivery(
     x_restrict: int,
     pixiv_text_targets: Iterable[str],
     pixiv_r18_text_allow_group: bool,
+    is_admin: bool = False,
 ) -> tuple[bool, str]:
     """「获取全文」能否在此渠道投递。返回 `(是否允许, 拒绝原因)`。
 
     判断顺序（**测试依赖这个顺序，不要改**）：
-        ① 渠道在 targets 内 → ② 非「R18 且群聊且开关未开」→ ③ 放行
+        ⓪ 管理员直接绕过 → ① 渠道在 targets 内 → ② 非「R18 且群聊且开关未开」→ ③ 放行
+
+    ⓪ 是 2026-10-02 用户要求：「管理员应当可以绕过获取全文的限制」。
+    两根轴（渠道 + R18）**都**对管理员失效 —— 管理员要能把任何一篇正文取到手上，
+    否则遇到 R18 就没办法在群里排查问题。
+
+    ⚠️ 一个需要知道的相互作用：`pixiv_admin_only` 默认为 True，此时**只有管理员**
+    能用这 4 个命令，于是这两根轴对实际使用者等于失效（能进来的人都是管理员）。
+    想让两根轴真正生效，要么把 `pixiv_admin_only` 关掉让普通群友也能用命令，
+    要么把管理员之外的发放方式另外设计。这是配置层面的取舍，不是这里的 bug。
     """
+    # ⓪ 管理员绕过（对所有轴生效）
+    if is_admin:
+        return True, ""
+
+    # 渠道名做归一化：配置里可能写 "Group"/"GROUP"/带空格。
+    # 顺带说明这也是被测试逼出来的 —— 原先只归一化了 targets 不归一化 channel，
+    # 于是 targets=["  Group  "] 配得再随意，channel="GROUP" 依然匹配不上。
+    channel = str(channel).strip().lower()
     targets = {str(t).strip().lower() for t in pixiv_text_targets}
 
     # ① 渠道轴
