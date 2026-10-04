@@ -16,13 +16,37 @@ from typing import Any
 
 import httpx
 from PIL import Image, ImageFilter
-from pixivpy3 import AppPixivAPI
+from pixivpy3 import AppPixivAPI, PixivError
 
 logger = logging.getLogger("nonebot_plugin_pixiv_novel")
 
 # i.pximg.net 会校验 Referer，不带就 403（已实测）
 COVER_REFERER = "https://www.pixiv.net/"
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+
+# ── 鉴权有效期：必须**主动换**，不能等失败 ──────────────────────────
+#
+# ⚠️⚠️ 实测（2026-10-04，生产故障复盘）：
+#   pixiv 的 access_token 只有 **1 小时**寿命（`/auth/token` 返回 `expires_in: 3600`），
+#   而 pixivpy3 的 `require_auth()` **只判 `access_token is None`、不判过期**，
+#   全库也**没有任何 401 自动重试**。
+#
+#   失效时的表现更坑：pixiv 返回 **HTTP 200 + 错误 JSON**
+#   （`{'error': {'message': '...invalid_grant'}}`），而 pixivpy3 的 `parse_result()`
+#   只做 `json.loads`、**完全不看状态码也不抛异常**。于是：
+#     · `novel_detail()` 静默返回 `{'error': ...}` → `x_restrict`/`user`/`image_urls`
+#       全变 None（R18 判定失效 + URL hook 里 `user.name` 直接 AttributeError）
+#     · 原来的 `_retry_sync` 只捕异常 → **既不重试、更不重鉴权**
+#     · 净效果：一次鉴权过期 = **永久失败到进程重启**，生产日志里就表现为
+#       「取 novel <id> 失败，确认链接是否有效」，且**进程越老越失败**
+#       （同一篇小说：刚启动的进程能取到，跑了两天的进程报 `现有键=['error']`）
+#
+#   对策两层，**缺一不可**：`_get_api()` 按本 TTL 主动重建鉴权（正面解决过期），
+#   `_call()` 把错误载荷当失败抛出（兜住边界与其它失效原因）。
+_AUTH_TTL_SECONDS = 50 * 60   # 留 10 分钟余量，避开「刚好在边界失效」
+
+# 成功响应绝不带顶层 `error`；这些键用于双保险（万一 pixiv 将来在成功体里也塞 error）。
+_OK_PAYLOAD_KEYS = ("novel", "novels", "novel_text", "next_url", "id", "title")
 
 
 def build_api(refresh_token: str, proxy: str) -> AppPixivAPI:
@@ -145,6 +169,21 @@ def process_cover(data: bytes, *, blur: bool, radius: int, max_width: int = 0) -
 _REQUIRED_NOVEL_FIELDS = ("id", "title", "x_restrict", "image_urls", "user")
 
 
+def is_error_payload(resp: Any) -> bool:
+    """pixivpy3 **静默返回**的错误载荷（HTTP 200 + 错误体）。
+
+    ⚠️ 实测（2026-10-04）：bearer 过期时 pixiv 不是返回 401，而是
+    **HTTP 200 + `{'error': {'message': '...invalid_grant'}}`**；pixivpy3 的
+    `parse_result()` 只做 `json.loads`、不看状态码也不抛异常 —— 调用方会把它
+    当数据用（`x_restrict`/`user`/`image_urls` 全是 None）而**不报错**。
+
+    所以必须在统一出口显式断言，否则 `_retry_sync` 永远不会触发。
+    """
+    if not isinstance(resp, dict) or "error" not in resp:
+        return False
+    return not any(k in resp for k in _OK_PAYLOAD_KEYS)
+
+
 def unwrap_novel_shape(resp: Any) -> Any:
     """把 `/v2/novel/detail` 的响应解包到「作品本体」。
 
@@ -257,17 +296,59 @@ class PixivClient:
         self.refresh_token = refresh_token
         self.proxy = proxy
         self._api: AppPixivAPI | None = None
+        # 上次鉴权时刻（monotonic）。pixiv 的 token 1 小时过期，必须自己盯 TTL。
+        self._auth_at: float = 0.0
 
     def _get_api(self) -> AppPixivAPI:
-        if self._api is None:
+        """取已鉴权客户端；**到期主动重建**（见 `_AUTH_TTL_SECONDS` 的实测说明）。
+
+        ⚠️ 不要退化成「为空才构造」：pixivpy3 不会自己换 token，
+        缓存一个实例到底就是「1 小时后永久失败」。
+        """
+        now = time.monotonic()
+        if self._api is None or (now - self._auth_at) >= _AUTH_TTL_SECONDS:
             self._api = build_api(self.refresh_token, self.proxy)
+            self._auth_at = time.monotonic()
         return self._api
+
+    def _invalidate_api(self) -> None:
+        """丢弃缓存的客户端 —— 下次 `_get_api()` 会重新 `auth()` 换新 token。"""
+        self._api = None
+
+    def _call(self, fn: Callable[[], Any]) -> Any:
+        """所有 App 接口的统一出口：**错误载荷当失败** + 重试 + 自愈。
+
+        ⚠️ 这一步是「鉴权过期后永久失败」的修复关键：pixivpy3 在 bearer 失效时
+        **不抛异常**（返回 `{'error': ...}`），而 `_retry_sync` 只捕异常 ——
+        不在这里断言，就既不重试也不重鉴权，故障会一直持续到进程重启。
+
+        `fn` 内部**必须每次重新调 `self._get_api()`**（别在外面先取好实例），
+        这样重试路径才拿得到重建过的新鉴权。
+        """
+
+        def _once() -> Any:
+            try:
+                resp = fn()
+            except Exception:
+                # 任何异常都可能是「这个实例已失效」（token 过期时 novel_text 就是
+                # 抛 PixivError 的）→ 丢掉它，让重试拿到新鉴权再试。
+                self._invalidate_api()
+                raise
+            if is_error_payload(resp):
+                self._invalidate_api()
+                raise PixivError(
+                    f"pixiv 返回错误载荷（已丢弃鉴权缓存，下次重试重新 auth）：{resp.get('error')}"
+                )
+            return resp
+
+        return _retry_sync(_once)
 
     async def user_novels(self, author_id: int) -> list[Any]:
         """作者的作品列表（新版在前）。"""
-        return await asyncio.to_thread(
-            lambda: _retry_sync(lambda: self._get_api().user_novels(author_id).novels)
+        resp = await asyncio.to_thread(
+            lambda: self._call(lambda: self._get_api().user_novels(author_id))
         )
+        return getattr(resp, "novels", None) or []
 
     async def author_info(self, author_id: int) -> tuple[str, str]:
         """取作者的 `(名字, 头像URL)`。取不到时返回 `("", "")`，**不抛异常**。
@@ -279,7 +360,7 @@ class PixivClient:
         """
         try:
             result = await asyncio.to_thread(
-                lambda: _retry_sync(lambda: self._get_api().user_novels(author_id))
+                lambda: self._call(lambda: self._get_api().user_novels(author_id))
             )
             user = getattr(result, "user", None)
             if user is None:
@@ -299,12 +380,14 @@ class PixivClient:
         `detail.image_urls` 恒为 None（→ 封面拿不到）。详见 `unwrap_novel_shape`。
         """
 
-        def _call() -> Any:
-            novel = unwrap_novel_shape(_retry_sync(lambda: self._get_api().novel_detail(novel_id)))
+        def _run() -> Any:
+            novel = unwrap_novel_shape(
+                self._call(lambda: self._get_api().novel_detail(novel_id))
+            )
             _check_novel_shape(novel)
             return novel
 
-        return await asyncio.to_thread(_call)
+        return await asyncio.to_thread(_run)
 
     async def novel_text(self, novel_id: int) -> str:
         """作品全文 → `text` 字段。
@@ -313,11 +396,11 @@ class PixivClient:
         所以 R18 判定必须来自 `novel_detail`，不能图省事在这里判。
         """
 
-        def _call() -> str:
-            nv = _retry_sync(lambda: self._get_api().novel_text(novel_id))
+        def _run() -> str:
+            nv = self._call(lambda: self._get_api().novel_text(novel_id))
             return getattr(nv, "text", "") or ""
 
-        return await asyncio.to_thread(_call)
+        return await asyncio.to_thread(_run)
 
     async def fetch_image(self, url: str) -> bytes:
         """下载图片（封面/头像通用）。**必须带 Referer**，否则 i.pximg.net 返回 403。"""

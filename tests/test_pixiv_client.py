@@ -10,6 +10,7 @@ from nonebot_plugin_pixiv_novel.pixiv_client import (
     unwrap_novel_shape,
 )
 from PIL import Image
+from pixivpy3 import PixivError
 
 
 def _png_bytes(size=(40, 40), color=(200, 30, 30)) -> bytes:
@@ -524,3 +525,221 @@ def test_retry_sync_success_costs_no_sleep(monkeypatch):
     monkeypatch.setattr(pixiv_client.time, "sleep", lambda s: slept.append(s))
     assert _retry_sync(lambda: 42, tries=3) == 42
     assert slept == []
+
+
+# ── 鉴权过期自愈 ────────────────────────────────────────────────────
+#
+# 生产故障（2026-10-04）的日志签名：
+#
+#   [WARNING] novel_detail 解包后缺少字段 ['id','title','x_restrict','image_urls','user']
+#             —— pixiv 响应结构可能变了。现有键=['error'].
+#   [message_sent] 取 novel 29275792 失败，确认链接是否有效
+#   [WARNING] URL hook 处理 novel=29275792 结束于异常: AttributeError: 'NoneType' ...'name'
+#
+# 根因：pixiv 的 access_token 只有 **1 小时**寿命；pixivpy3 的 `require_auth()`
+# 只判 `is None`、不判过期，也**没有 401 重试**；而 bearer 失效时 pixiv 返回的是
+# **HTTP 200 + 错误 JSON**，`parse_result()` 只做 `json.loads`、不抛异常。
+# 于是「缓存实例 + 只捕异常的重试」= 一过期就**永久失败到进程重启**，
+# 且**进程越老越失败**（生产里同一篇小说：新进程能取到、跑两天的进程报 error）。
+#
+# 修法两层：`_get_api()` 按 TTL 主动重建 + `_call()` 把错误载荷当失败。
+
+# 生产日志里那条真实错误体（HTTP 200，键只有 error）
+_PROD_AUTH_ERROR = {
+    "error": {
+        "user_message": "",
+        "message": (
+            "Error occurred at the OAuth process. Please check your Access Token"
+            " to fix this. Error Message: invalid_grant"
+        ),
+        "reason": "",
+        "user_message_details": {},
+    }
+}
+
+
+def test_is_error_payload_recognizes_the_real_production_error():
+    """必须认出生产那条「HTTP 200 + error 体」—— 这是修这个 bug 的前提。"""
+    assert pixiv_client.is_error_payload(wrap_json(_PROD_AUTH_ERROR))
+
+
+@pytest.mark.parametrize(
+    "fixture", ["novel_detail_r18.json", "user_novels.json", "novel_text.json"]
+)
+def test_is_error_payload_does_not_misfire_on_real_success(fixture):
+    """真实成功响应不能被误判成错误 —— 误判会让正常作品全部「取失败」。"""
+    assert not pixiv_client.is_error_payload(load_fixture(fixture))
+
+
+@pytest.mark.parametrize("value", [None, "", "error", [], 0])
+def test_is_error_payload_ignores_non_dict(value):
+    assert not pixiv_client.is_error_payload(value)
+
+
+def test_auth_ttl_sits_below_the_one_hour_token_lifetime():
+    """TTL 必须 < 1 小时（留余量），也不能过短（否则每次调用都白换一次 token）。"""
+    assert 10 * 60 <= pixiv_client._AUTH_TTL_SECONDS < 60 * 60
+
+
+def test_get_api_rebuilds_only_after_ttl(monkeypatch):
+    """TTL 到期**主动**重建鉴权；TTL 内复用同一实例（不白换 token）。"""
+    monkeypatch.setattr(pixiv_client, "_AUTH_TTL_SECONDS", 100.0)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pixiv_client.time, "monotonic", lambda: clock["t"])
+    made = []
+
+    class FakeAPI:
+        def __init__(self, **kwargs):
+            made.append(self)
+
+        def auth(self, refresh_token):
+            pass
+
+    monkeypatch.setattr(pixiv_client, "AppPixivAPI", FakeAPI)
+    client = PixivClient("tok", "")
+
+    client._get_api()
+    client._get_api()
+    assert len(made) == 1, "TTL 内应复用，不该重复鉴权"
+
+    clock["t"] += 99
+    client._get_api()
+    assert len(made) == 1, "还没到 TTL 就不该重建"
+
+    clock["t"] += 2  # 累计 101s > 100s
+    client._get_api()
+    assert len(made) == 2, "过了 TTL 必须重建鉴权（这正是原 bug 的正面修复）"
+
+
+@pytest.mark.asyncio
+async def test_novel_detail_reauths_and_recovers_from_expired_token(monkeypatch):
+    """★ 核心回归：静默 error 载荷 ⇒ 丢弃旧实例、重新鉴权、取回作品。
+
+    修复前这里会**静默返回** `{'error': ...}`：`x_restrict`/`user` 全是 None，
+    于是 R18 判定失效 + URL hook 里 `user.name` 直接 AttributeError。
+    """
+    monkeypatch.setattr(pixiv_client.time, "sleep", lambda _s: None)
+    made = []
+
+    class FakeAPI:
+        def __init__(self, **kwargs):
+            made.append(self)
+            self.auth_calls = 0
+
+        def auth(self, refresh_token):
+            self.auth_calls += 1
+
+        def novel_detail(self, novel_id):
+            if len(made) == 1:  # 第 1 个实例 = 已经过期的那一个
+                return wrap_json(_PROD_AUTH_ERROR)
+            return load_fixture("novel_detail_r18.json")
+
+    monkeypatch.setattr(pixiv_client, "AppPixivAPI", FakeAPI)
+    client = PixivClient("tok", "")
+
+    novel = await client.novel_detail(29275792)
+
+    assert len(made) == 2, "必须丢弃过期实例并重建鉴权"
+    assert made[1].auth_calls == 1, "新实例要真的做过 auth()"
+    assert novel["x_restrict"] == 1, "重新鉴权后必须真的取到作品（R18 判定可用）"
+    assert novel["user"]["name"], "user 不能再是 None（那是 AttributeError 的来源）"
+
+
+@pytest.mark.asyncio
+async def test_novel_detail_raises_when_error_payload_persists(monkeypatch):
+    """一直失败就要**抛异常**，不能把错误当数据用（调用方才能报错而非发卡片）。"""
+    monkeypatch.setattr(pixiv_client.time, "sleep", lambda _s: None)
+
+    class FakeAPI:
+        def __init__(self, **kwargs):
+            pass
+
+        def auth(self, refresh_token):
+            pass
+
+        def novel_detail(self, novel_id):
+            return wrap_json(_PROD_AUTH_ERROR)
+
+    monkeypatch.setattr(pixiv_client, "AppPixivAPI", FakeAPI)
+    client = PixivClient("tok", "")
+
+    with pytest.raises(PixivError, match="invalid_grant"):
+        await client.novel_detail(29275792)
+
+
+@pytest.mark.asyncio
+async def test_novel_text_reauths_after_pixiv_error(monkeypatch):
+    """`novel_text` 的失效表现与 detail **不同**（它是抛 PixivError），同样要自愈。"""
+    monkeypatch.setattr(pixiv_client.time, "sleep", lambda _s: None)
+    made = []
+
+    class FakeAPI:
+        def __init__(self, **kwargs):
+            made.append(self)
+
+        def auth(self, refresh_token):
+            pass
+
+        def novel_text(self, novel_id):
+            if len(made) == 1:
+                raise PixivError(
+                    "Extract novel content error: 'NoneType' object has no attribute 'groups'"
+                )
+            return load_fixture("novel_text.json")
+
+    monkeypatch.setattr(pixiv_client, "AppPixivAPI", FakeAPI)
+    client = PixivClient("tok", "")
+
+    text = await client.novel_text(29275792)
+
+    assert len(made) == 2, "抛异常时也要换掉实例再试"
+    assert text, "重新鉴权后要拿到正文"
+
+
+@pytest.mark.asyncio
+async def test_user_novels_reauths_on_error_payload(monkeypatch):
+    """订阅轮询也走这条出口 —— 否则鉴权一过期就整个轮询白跑。"""
+    monkeypatch.setattr(pixiv_client.time, "sleep", lambda _s: None)
+    made = []
+
+    class FakeAPI:
+        def __init__(self, **kwargs):
+            made.append(self)
+
+        def auth(self, refresh_token):
+            pass
+
+        def user_novels(self, user_id):
+            if len(made) == 1:
+                return wrap_json(_PROD_AUTH_ERROR)
+            return load_fixture("user_novels.json")
+
+    monkeypatch.setattr(pixiv_client, "AppPixivAPI", FakeAPI)
+    client = PixivClient("tok", "")
+
+    novels = await client.user_novels(12345)
+
+    assert len(made) == 2
+    assert len(novels) == 3, "要拿到真实作品列表"
+
+
+@pytest.mark.asyncio
+async def test_user_novels_raises_instead_of_silently_returning_empty(monkeypatch):
+    """不能「静默返回空列表」—— 那会让轮询把一轮新作永久跳过。"""
+    monkeypatch.setattr(pixiv_client.time, "sleep", lambda _s: None)
+
+    class FakeAPI:
+        def __init__(self, **kwargs):
+            pass
+
+        def auth(self, refresh_token):
+            pass
+
+        def user_novels(self, user_id):
+            return wrap_json(_PROD_AUTH_ERROR)
+
+    monkeypatch.setattr(pixiv_client, "AppPixivAPI", FakeAPI)
+    client = PixivClient("tok", "")
+
+    with pytest.raises(PixivError):
+        await client.user_novels(12345)
