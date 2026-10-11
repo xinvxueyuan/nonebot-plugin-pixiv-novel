@@ -31,6 +31,7 @@ from nonebot.adapters.onebot.v11 import (
 )
 from nonebot.log import LoguruHandler
 from nonebot.params import CommandArg
+from nonebot.plugin import PluginMetadata
 
 logger = logging.getLogger("nonebot_plugin_pixiv_novel")
 
@@ -81,6 +82,33 @@ from .pixiv_client import PixivClient, original_cover_url
 from .poller import poll_once
 
 plugin_config = get_plugin_config(Config)
+
+__plugin_meta__ = PluginMetadata(
+    name="pixiv 小说订阅",
+    description=(
+        "pixiv 小说订阅推送：按群订阅作者新作自动推送，支持拉取单篇全文（R18 封面可打码，渠道/全文/推送三轴可配）"
+    ),
+    usage=(
+        "订阅 <作者id>      本群订阅该作者新作（仅群聊）\n"
+        "退订 <作者id>      取消订阅（仅群聊）\n"
+        "订阅列表           查看本群订阅（渲染成图片）\n"
+        "获取全文 <作品id>  拉取小说全文（群聊/私聊，受 PIXIV_TEXT_TARGETS 约束）\n"
+        "参数支持直接粘贴 pixiv 链接；所有命令默认仅管理员可用"
+    ),
+    type="application",
+    homepage="https://github.com/xinvxueyuan/nonebot-plugin-pixiv-novel",
+    supported_adapters={"nonebot.adapters.onebot.v11"},
+    extra={
+        "menu_type": "功能",
+        "order": 25,
+        "commands": [
+            {"command": "订阅 <作者id>", "desc": "本群订阅该作者新作（仅群聊）"},
+            {"command": "退订 <作者id>", "desc": "取消订阅（仅群聊）"},
+            {"command": "订阅列表", "desc": "查看本群订阅（渲染成图片）"},
+            {"command": "获取全文 <作品id>", "desc": "拉取小说全文（群聊/私聊）"},
+        ],
+    },
+)
 
 DENIED_MSG = "此指令仅管理员可用"
 GROUP_DENIED_MSG = "本插件未在此群启用（不在群白名单内，或已被列入群黑名单）"
