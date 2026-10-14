@@ -112,4 +112,4 @@ uv run ruff check .
 
 ## 许可
 
-本仓库**未附加**开源许可证，默认**保留所有权利**（All rights reserved）。如需复用请联系作者。
+MIT（见 `pyproject.toml` 的 `license` 字段；仓库暂未附 `LICENSE` 文件）。
