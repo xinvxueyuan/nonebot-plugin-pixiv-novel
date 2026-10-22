@@ -135,7 +135,7 @@ uv run ruff check .
 
 ### 许可证
 
-MIT（见 `pyproject.toml` 的 `license` 字段；仓库暂未附 `LICENSE` 文件）。
+MIT —— 全文见 [`LICENSE`](LICENSE)；`pyproject.toml` 的 `license` 字段同为 MIT。
 
 ### 相关仓库
 
