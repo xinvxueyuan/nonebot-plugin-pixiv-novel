@@ -2,11 +2,15 @@
 
 pixiv 小说订阅推送插件（NoneBot2 / OneBot V11）：按群订阅作者新作自动推送，并支持拉取单篇全文，R18 封面可打码。
 
+[![Python](https://img.shields.io/badge/python-3.10--3.13-blue)](pyproject.toml)
+
+> **qbot 插件** · 宿主仓库：[xinvxueyuan/qbot](https://github.com/xinvxueyuan/qbot)
+
 > - 命令裸词触发（qbot 的 `COMMAND_START=[""]`）：`订阅` / `退订` / `订阅列表` / `获取全文`。
 > - 订阅**按群隔离**；R18 的「渠道 / 全文 / 推送」三根轴互相独立，默认偏保守（**R18 全文默认哪里都发不出去**）。
 > - 只通过 GitHub Release 分发，不发布到 PyPI。
 
-## 功能
+## 功能特性
 
 - **新作推送**：按群订阅作者，定时轮询该作者新作并推送到群；过滤不可见 / 仅 mypixiv 可见的作品。
 - **订阅播种**：订阅时取作者当前最新作品 ID 作为基线，**历史作品不会被一次性补推**。
@@ -22,20 +26,34 @@ pixiv 小说订阅推送插件（NoneBot2 / OneBot V11）：按群订阅作者�
 - **权限闸门**：命令与被动 hook 先过群白名单，再过管理员闸门；被拒会明确回文案（不用 NoneBot 的静默 `permission`）。
 - 订阅数据按 `(group_id, author_id)` 存在 SQLite（`localstore` 数据目录），各群之间不共享。
 
-## 命令
+## 安装
 
-默认**所有人可用**（`PIXIV_ADMIN_ONLY=false`）；设为 `true` 后仅管理员（`PIXIV_ADMIN_IDS`，名单为空则回退 NoneBot 全局 `SUPERUSERS`）可用。
+### 依赖
 
-| 命令 | 别名 | 说明 |
-|---|---|---|
-| `订阅 <作者id>` | — | 仅群聊。本群订阅该作者新作（订阅时播种基线 + 顺带存作者名/头像） |
-| `退订 <作者id>` | — | 仅群聊。取消订阅 |
-| `订阅列表` | — | 仅群聊。查看本群订阅（渲染成图片，失败回退纯文本） |
-| `获取全文 <作品id>` | — | 群聊 / 私聊（受 `PIXIV_TEXT_TARGETS` 约束）。拉取小说全文；不带参数时也可**引用机器人发的作品卡片** |
+- 运行依赖：`nonebot2 >= 2.5.0`、`nonebot-adapter-onebot >= 2.4.0`、`nonebot-plugin-apscheduler >= 0.5.0`、`nonebot-plugin-localstore >= 0.7.4`、`nonebot-plugin-htmlkit >= 0.1.0rc5`、`pixivpy3 >= 3.7.5`、`httpx >= 0.28.0`、`pillow >= 12.0.0`；Python `>=3.10,<3.14`。
+- 可选依赖（缺失只降级，不影响插件加载）：
+  - `nonebot-plugin-htmlkit` 加载失败 → 「订阅列表」回退纯文本；
+  - `nonebot-plugin-message-reaction`（表态）没装 → 没有表情反馈；该库不在 PyPI，由宿主以 git 子模块提供。
 
-参数支持直接粘贴 pixiv 链接。「获取全文」对**管理员**会绕过渠道与 R18 两根轴（见配置）。
+### 前置条件
+
+1. pixiv 账号的「国・地域」设为**日本**（否则 R18 内容受地区限制；本服务器出口在 US，尤其要注意）
+2. pixiv 账号打开「显示 R18 内容」
+3. 服务器能访问 `127.0.0.1:1081` 代理（pixiv 全域名国内直连不通）
+4. 系统有 CJK 字体（渲染订阅列表用；Debian 上装 `fonts-noto-cjk`）
+
+### 接入宿主
+
+```bash
+git submodule add -b main https://github.com/xinvxueyuan/nonebot-plugin-pixiv-novel.git vendor/nonebot-plugin-pixiv-novel
+git -C vendor/nonebot-plugin-pixiv-novel checkout <钉定 SHA>
+```
+
+- 宿主 `[tool.nonebot] plugin_dirs` 加一行 `vendor/nonebot-plugin-pixiv-novel/src/plugins`
 
 ## 配置
+
+### 环境变量
 
 | 键 | 默认 | 说明 |
 |---|---|---|
@@ -75,27 +93,36 @@ pixiv 小说订阅推送插件（NoneBot2 / OneBot V11）：按群订阅作者�
 **默认配置的合并效果**（targets 只有 group + 轴 2 关闭）：**R18 全文哪里都发不出去**。
 这是刻意的保守默认。想让管理员在私聊看 R18 全文，把 `PIXIV_TEXT_TARGETS` 加上 `"private"` 即可。
 
-## 依赖与安装
+## 使用 / 命令
 
-- 运行依赖：`nonebot2 >= 2.5.0`、`nonebot-adapter-onebot >= 2.4.0`、`nonebot-plugin-apscheduler >= 0.5.0`、`nonebot-plugin-localstore >= 0.7.4`、`nonebot-plugin-htmlkit >= 0.1.0rc5`、`pixivpy3 >= 3.7.5`、`httpx >= 0.28.0`、`pillow >= 12.0.0`；Python `>=3.10,<3.14`。
-- 可选依赖（缺失只降级，不影响插件加载）：
-  - `nonebot-plugin-htmlkit` 加载失败 → 「订阅列表」回退纯文本；
-  - `nonebot-plugin-message-reaction`（表态）没装 → 没有表情反馈；该库不在 PyPI，由宿主以 git 子模块提供。
-- 前置条件：
-  1. pixiv 账号的「国・地域」设为**日本**（否则 R18 内容受地区限制；本服务器出口在 US，尤其要注意）
-  2. pixiv 账号打开「显示 R18 内容」
-  3. 服务器能访问 `127.0.0.1:1081` 代理（pixiv 全域名国内直连不通）
-  4. 系统有 CJK 字体（渲染订阅列表用；Debian 上装 `fonts-noto-cjk`）
-- 安装（宿主以 git 子模块引入）：
+### 命令表
 
-```bash
-git submodule add -b main https://github.com/xinvxueyuan/nonebot-plugin-pixiv-novel.git vendor/nonebot-plugin-pixiv-novel
-git -C vendor/nonebot-plugin-pixiv-novel checkout <钉定 SHA>
-```
+默认**所有人可用**（`PIXIV_ADMIN_ONLY=false`）；设为 `true` 后仅管理员（`PIXIV_ADMIN_IDS`，名单为空则回退 NoneBot 全局 `SUPERUSERS`）可用。
 
-- 宿主 `[tool.nonebot] plugin_dirs` 加一行 `vendor/nonebot-plugin-pixiv-novel/src/plugins`
+| 命令 | 别名 | 说明 |
+|---|---|---|
+| `订阅 <作者id>` | — | 仅群聊。本群订阅该作者新作（订阅时播种基线 + 顺带存作者名/头像） |
+| `退订 <作者id>` | — | 仅群聊。取消订阅 |
+| `订阅列表` | — | 仅群聊。查看本群订阅（渲染成图片，失败回退纯文本） |
+| `获取全文 <作品id>` | — | 群聊 / 私聊（受 `PIXIV_TEXT_TARGETS` 约束）。拉取小说全文；不带参数时也可**引用机器人发的作品卡片** |
 
-## 测试与门禁
+参数支持直接粘贴 pixiv 链接。「获取全文」对**管理员**会绕过渠道与 R18 两根轴（见配置）。
+
+### 其他约定
+
+- **不引用**：回复不引用原消息，直接发。
+- **不共享**：订阅是**按群**隔离的，A 群的订阅不会推到 B 群。
+- **分发**：只通过 GitHub Release 发布版本，不发 PyPI。
+
+## 开发与测试
+
+### 开发环境
+
+- dev 依赖（`pyproject.toml` 的 `dependency-groups.dev`）：`pytest`、`pytest-asyncio`（`asyncio_mode = "auto"`）、`ruff`、`nonebot-plugin-alconna`（「表态接线」集成测试用；该库不在 PyPI，宿主以 git 子模块提供）。
+- 测试数据在 `tests/fixtures/`（真实 pixiv 响应的 JSON 快照）。
+- `scripts/` 下是抓取真实 pixiv 响应、量渲染布局的探针脚本，不在 `pytest` 收集范围内（`testpaths = ["tests"]`）。
+
+### 测试与门禁
 
 ```bash
 uv run python -m pytest tests/ -q
@@ -104,12 +131,13 @@ uv run ruff check .
 
 本仓未配置 pyright（`pyproject.toml` 里没有 `[tool.pyright]`），`ruff format` 也未纳入门禁 —— 门禁以上面两条为准。
 
-## 其他约定
+## 许可证与相关仓库
 
-- **不引用**：回复不引用原消息，直接发。
-- **不共享**：订阅是**按群**隔离的，A 群的订阅不会推到 B 群。
-- **分发**：只通过 GitHub Release 发布版本，不发 PyPI。
-
-## 许可
+### 许可证
 
 MIT（见 `pyproject.toml` 的 `license` 字段；仓库暂未附 `LICENSE` 文件）。
+
+### 相关仓库
+
+- [xinvxueyuan/qbot](https://github.com/xinvxueyuan/qbot)：宿主仓库，本插件以 `vendor/` 子模块方式接入。
+- [xinvxueyuan/nonebot-plugin-message-reaction](https://github.com/xinvxueyuan/nonebot-plugin-message-reaction)：可选依赖，提供「处理中 → 完成 / 失败」的表态反馈；缺失时插件照常工作。
